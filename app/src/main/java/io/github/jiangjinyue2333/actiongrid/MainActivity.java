@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.View;
@@ -38,6 +39,8 @@ import io.github.libxposed.service.XposedService;
 
 public final class MainActivity extends Activity implements ActionGridApp.ServiceListener {
     private static final String TARGET_PACKAGE = "com.miui.home";
+    private static final String SOURCE_REPOSITORY_URL =
+            "https://github.com/jiangjinyue2333/ActionGrid";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1002;
 
     private LinearLayout statusPage;
@@ -143,6 +146,8 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         restartHome.setOnClickListener(view -> confirmHomeRestart());
         openAbout.setOnClickListener(view -> showAboutPage());
         findViewById(R.id.back_to_status).setOnClickListener(view -> showStatusPage());
+        findViewById(R.id.open_source_repository)
+                .setOnClickListener(view -> openSourceRepository());
         loggingSwitch.setOnCheckedChangeListener((button, enabled) -> {
             LogStore.setEnabled(this, enabled);
             aboutStatus.setText(enabled ? "已开始记录新日志" : "日志记录已关闭，旧日志已清除");
@@ -334,6 +339,14 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         Intent chooser = Intent.createChooser(send, getString(R.string.share_logs))
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         startActivity(chooser);
+    }
+
+    private void openSourceRepository() {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(SOURCE_REPOSITORY_URL)));
+        } catch (RuntimeException exception) {
+            aboutStatus.setText(R.string.source_repository_unavailable);
+        }
     }
 
     private void checkUpdates(boolean manual) {

@@ -26,6 +26,8 @@ Require-Text 'app/build.gradle.kts' 'targetSdk = 37' '目标版本必须是 Andr
 Require-Text 'app/build.gradle.kts' 'versionCode = 15' '0.3 的 versionCode 必须为 15'
 Require-Text 'app/build.gradle.kts' 'versionName = "0.3"' '正式版本名必须为 0.3'
 Require-Text 'app/src/main/res/values/strings.xml' '<string name="author">作者：江浸月</string>' '关于页必须显示作者'
+Require-Text 'app/src/main/res/layout/activity_main.xml' '@\+id/open_source_repository' '关于页必须提供源码仓库按钮'
+Require-Text 'app/src/main/java/io/github/jiangjinyue2333/actiongrid/MainActivity.java' 'https://github\.com/jiangjinyue2333/ActionGrid' '源码仓库入口必须指向公开 GitHub 仓库'
 Require-Text 'app/src/main/resources/META-INF/xposed/java_init.list' '^io\.github\.jiangjinyue2333\.actiongrid\.hook\.ActionGridModule$' 'Hook 入口不正确'
 Require-Text 'app/src/main/resources/META-INF/xposed/module.prop' '^minApiVersion=102$' 'Modern API 最低版本不正确'
 Require-Text 'app/src/main/resources/META-INF/xposed/module.prop' '^targetApiVersion=102$' 'Modern API 目标版本不正确'

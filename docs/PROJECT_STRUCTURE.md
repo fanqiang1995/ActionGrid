@@ -30,6 +30,7 @@ ActionGrid/
 - `:hook` 是 Android Library，仅编译依赖 libxposed API，不依赖 `:app`。
 - Xposed 入口为 `ActionGridModule`，静态作用域仅包含 `com.miui.home`。
 - 应用最低支持 Android 14，目标版本为 Android 17。
+- 关于页显示作者，并通过明确按钮打开 GitHub 源码仓库。
 
 ## 完成任务前检查
 
