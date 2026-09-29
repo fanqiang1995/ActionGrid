@@ -61,9 +61,19 @@ Require-Text 'app/src/main/java/io/github/jiangjinyue2333/actiongrid/update/Upda
 Require-Text 'app/src/main/java/io/github/jiangjinyue2333/actiongrid/update/UpdateDownloader.java' 'setDestinationInExternalFilesDir' '更新必须下载到应用专属外部目录'
 Require-Text 'app/src/main/AndroidManifest.xml' 'android:readPermission="io\.github\.jiangjinyue2333\.actiongrid\.permission\.READ_DIAGNOSTICS"' '日志文件必须由平台 URI grant 控制读取'
 Require-Text 'app/src/main/AndroidManifest.xml' 'android:permission="android\.permission\.SEND_DOWNLOAD_COMPLETED_INTENTS"' '更新完成广播必须只接受系统下载进程'
+Require-Text 'scripts/verify-release.ps1' 'expectedCertificateSha256' '发布验证必须固定证书连续性'
+Require-Text '.github/workflows/signed-apk.yml' "github.ref == 'refs/heads/main'" '正式签名必须限制在 main 分支'
+Require-Text '.github/workflows/signed-apk.yml' 'run: ./scripts/build-release.ps1' '云端构建必须复用正式发布脚本'
+Require-Text '.github/workflows/signed-apk.yml' 'if: always\(\)' '签名密钥清理必须始终执行'
+Require-Text 'docs/PROJECT_STRUCTURE.md' 'signed-apk.yml' '项目结构文档必须说明云端签名入口'
 Require-Text 'docs/PROJECT_STRUCTURE.md' '当前正式版本为 `0\.3`（`versionCode=15`）' '项目结构文档必须同步正式版本'
 Require-Text 'README.md' '作者：江浸月' '公开说明必须包含作者'
 Require-Text 'LICENSE' '江浸月' '开源许可必须包含作者'
+
+$releaseWorkflow = Get-Content -Raw -LiteralPath (Join-Path $root '.github/workflows/signed-apk.yml')
+if ($releaseWorkflow -match '(?m)^\s*(pull_request|pull_request_target)\s*:') {
+    throw '结构验证失败：外部 PR 不得触发正式签名工作流'
+}
 
 $scopeLines = @(Get-Content -LiteralPath (Join-Path $root 'app/src/main/resources/META-INF/xposed/scope.list') |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
