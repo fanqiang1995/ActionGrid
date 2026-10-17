@@ -100,6 +100,9 @@ $checkWorkflow = [regex]::Split($releaseWorkflow, '(?m)^\s{2}release:\s*$')[0]
 if ($checkWorkflow -match 'secrets\.') {
     throw '结构验证失败：检查 job 不得读取签名 Secrets'
 }
+if ($checkWorkflow -notmatch '(?m)^\s+"GRADLE_USER_HOME=\$env:RUNNER_TEMP/gradle" >> \$env:GITHUB_ENV$') {
+    throw '结构验证失败：检查 job 写入 GRADLE_USER_HOME 时必须保留 PowerShell 字符串引号'
+}
 
 $scopeLines = @(Get-Content -LiteralPath (Join-Path $root 'app/src/main/resources/META-INF/xposed/scope.list') |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

@@ -19,7 +19,8 @@ jobs:
         shell: pwsh
     steps:
       - name: Configure Gradle cache
-        run: "GRADLE_USER_HOME=$env:RUNNER_TEMP/gradle >> $env:GITHUB_ENV"
+        run: |
+          "GRADLE_USER_HOME=$env:RUNNER_TEMP/gradle" >> $env:GITHUB_ENV
 
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
