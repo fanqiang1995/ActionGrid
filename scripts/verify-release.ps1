@@ -138,10 +138,10 @@ $defined = (& $apkanalyzer dex packages --defined-only $apk) -join "`n"
 if ($LASTEXITCODE -ne 0) {
     throw 'apkanalyzer 无法读取 DEX'
 }
-if ($defined -notmatch 'io\.github\.jiangjinyue2333\.actiongrid\.hook\.ActionGridModule') {
+if ($defined -notmatch '(?m)^C\s+\S+\s+\d+\s+\d+\s+\d+\s+io\.github\.jiangjinyue2333\.actiongrid\.hook\.ActionGridModule$') {
     throw 'Release DEX 中缺少 ActionGridModule'
 }
-if ($defined -match '(?m)(?:de\.robv\.android\.xposed|io\.github\.libxposed\.api)\.') {
+if ($defined -match '(?m)^C\s+.*(?:de\.robv\.android\.xposed|io\.github\.libxposed\.api)\.') {
     throw 'APK 错误打包了 Xposed API 实现类'
 }
 
