@@ -350,7 +350,8 @@ final class MiuiHomeBridge {
         try {
             LauncherApps.ShortcutQuery query = new LauncherApps.ShortcutQuery()
                     .setQueryFlags(LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC
-                            | LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST)
+                            | LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST
+                            | LauncherApps.ShortcutQuery.FLAG_MATCH_PINNED)
                     .setPackage(target.component().getPackageName());
             if (activityScoped) {
                 query.setActivity(target.component());

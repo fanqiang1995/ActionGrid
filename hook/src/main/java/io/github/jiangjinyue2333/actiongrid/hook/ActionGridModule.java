@@ -1,6 +1,9 @@
 package io.github.jiangjinyue2333.actiongrid.hook;
 
+import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
+import android.os.Build;
 import android.os.Process;
 import android.util.Log;
 import android.view.MotionEvent;
@@ -27,6 +30,8 @@ public final class ActionGridModule extends XposedModule {
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
         targetProcess = TARGET_PACKAGE.equals(param.getProcessName()) && !param.isSystemServer();
+        Log.i(TAG, "onModuleLoaded process=" + param.getProcessName()
+                + " target=" + targetProcess);
         if (targetProcess) {
             listenForRestartRequests();
         }
@@ -51,17 +56,44 @@ public final class ActionGridModule extends XposedModule {
 
     @Override
     public void onPackageLoaded(PackageLoadedParam param) {
-        packageAccepted = targetProcess
-                && param.isFirstPackage()
-                && TARGET_PACKAGE.equals(param.getPackageName());
+        Log.i(TAG, "onPackageLoaded package=" + param.getPackageName()
+                + " targetProcess=" + targetProcess);
+        if (targetProcess && TARGET_PACKAGE.equals(param.getPackageName())) {
+            packageAccepted = true;
+        }
     }
 
     @Override
     public void onPackageReady(PackageReadyParam param) {
+        Log.i(TAG, "onPackageReady package=" + param.getPackageName()
+                + " accepted=" + packageAccepted);
         if (!packageAccepted || !TARGET_PACKAGE.equals(param.getPackageName())) {
             return;
         }
         try {
+            ApplicationInfo application = param.getApplicationInfo();
+            boolean hasCode = application != null
+                    && (application.flags & ApplicationInfo.FLAG_HAS_CODE) != 0;
+            long version = applicationVersion(application);
+            boolean nativeCandidate = HyperOs4Compatibility.isNativeCandidate(
+                    Build.VERSION.SDK_INT, version, hasCode);
+            if (nativeCandidate) {
+                if (!HyperOs4Compatibility.supports(Build.VERSION.SDK_INT, version, hasCode)) {
+                    log(Log.WARN, TAG, "HyperOS 4 native profile unsupported; legacy hooks disabled"
+                            + " version=" + version);
+                    return;
+                }
+                // Native placement is preferred, but Java icon actions remain the fallback.
+                Log.i(TAG, "HyperOS4 native placement path selected"
+                        + " sdk=" + Build.VERSION.SDK_INT
+                        + " version=" + version + " hasCode=" + hasCode);
+                boolean installed = HyperOs4NodeAdapter.installApplicationActions(this);
+                log(installed ? Log.INFO : Log.ERROR, TAG,
+                        "HyperOS 4 native profile " + HyperOs4Compatibility.profileName(version)
+                                + "; Java application actions "
+                                + (installed ? "installed" : "unavailable"));
+                return;
+            }
             CompatibilityReport report = CapabilityProbe.probe(param.getClassLoader());
             log(Log.INFO, TAG, "Probe " + report.summary());
             if (!report.availableCapabilities().contains(Capability.ICON_BINDING)) {
@@ -72,6 +104,7 @@ public final class ActionGridModule extends XposedModule {
             ActionController controller = new ActionController(bridge);
             installIconHooks(controller, bridge);
         } catch (Throwable throwable) {
+            Log.e(TAG, "Initialization failed", throwable);
             log(Log.ERROR, TAG, "Initialization failed: "
                     + throwable.getClass().getSimpleName());
         }
@@ -80,7 +113,7 @@ public final class ActionGridModule extends XposedModule {
     private void installIconHooks(ActionController controller, MiuiHomeBridge bridge)
             throws NoSuchMethodException {
         Method setTag = View.class.getMethod("setTag", Object.class);
-        hook(setTag).intercept(chain -> {
+        hook(setTag).setId("actiongrid.legacy.bind.v1").intercept(chain -> {
             Object result = chain.proceed();
             if (chain.getThisObject() instanceof View view && controller.isSupportedIcon(view)) {
                 view.post(() -> runSafely("bind", () -> controller.onBound(view)));
@@ -90,7 +123,7 @@ public final class ActionGridModule extends XposedModule {
 
         Method attached = View.class.getDeclaredMethod("onAttachedToWindow");
         attached.setAccessible(true);
-        hook(attached).intercept(chain -> {
+        hook(attached).setId("actiongrid.legacy.attach.v1").intercept(chain -> {
             Object result = chain.proceed();
             if (chain.getThisObject() instanceof View view && controller.isSupportedIcon(view)) {
                 view.post(() -> runSafely("attach", () -> controller.onBound(view)));
@@ -99,7 +132,7 @@ public final class ActionGridModule extends XposedModule {
         });
 
         Method createNode = View.class.getMethod("createAccessibilityNodeInfo");
-        hook(createNode).intercept(chain -> {
+        hook(createNode).setId("actiongrid.legacy.node.v1").intercept(chain -> {
             Object result = chain.proceed();
             if (chain.getThisObject() instanceof View view
                     && result instanceof AccessibilityNodeInfo info) {
@@ -110,7 +143,7 @@ public final class ActionGridModule extends XposedModule {
 
         Method performAction = View.class.getMethod(
                 "performAccessibilityAction", int.class, android.os.Bundle.class);
-        hook(performAction).intercept(chain -> {
+        hook(performAction).setId("actiongrid.legacy.action.v1").intercept(chain -> {
             if (chain.getThisObject() instanceof View view) {
                 try {
                     if (controller.performAccessibilityAction(view, (int) chain.getArg(0))) {
@@ -124,7 +157,7 @@ public final class ActionGridModule extends XposedModule {
         });
 
         Method getProvider = View.class.getMethod("getAccessibilityNodeProvider");
-        hook(getProvider).intercept(chain -> {
+        hook(getProvider).setId("actiongrid.legacy.provider.v1").intercept(chain -> {
             Object result = chain.proceed();
             if (chain.getThisObject() instanceof View view) {
                 try {
@@ -142,7 +175,8 @@ public final class ActionGridModule extends XposedModule {
             hoverMethods.add(hostClass.getMethod("dispatchHoverEvent", MotionEvent.class));
         }
         for (Method hoverMethod : hoverMethods) {
-            hook(hoverMethod).intercept(chain -> {
+            hook(hoverMethod).setId("actiongrid.legacy.hover."
+                    + hoverMethod.getDeclaringClass().getName()).intercept(chain -> {
                 if (chain.getThisObject() instanceof View view) {
                     try {
                         if (controller.dispatchHoverEvent(
@@ -163,6 +197,25 @@ public final class ActionGridModule extends XposedModule {
             runnable.run();
         } catch (RuntimeException exception) {
             logHookFailure(stage, exception);
+        }
+    }
+
+    @SuppressLint("DiscouragedPrivateApi")
+    private static long applicationVersion(ApplicationInfo application) {
+        if (application == null) {
+            return 0L;
+        }
+        try {
+            return ((Number) ApplicationInfo.class.getMethod(
+                    "getLongVersionCode").invoke(application)).longValue();
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            try {
+                var field = ApplicationInfo.class.getDeclaredField("versionCode");
+                field.setAccessible(true);
+                return ((Number) field.get(application)).longValue();
+            } catch (ReflectiveOperationException | RuntimeException unavailable) {
+                return 0L;
+            }
         }
     }
 

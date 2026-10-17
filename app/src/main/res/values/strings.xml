@@ -9,6 +9,7 @@
     <string name="module_label">模块</string>
     <string name="scope_label">作用域</string>
     <string name="miui_home_label">小米桌面</string>
+    <string name="desktop_process_label">桌面进程</string>
     <string name="enable_module_hint">请确认已在支持 Modern API 102 的框架中启用模块</string>
     <string name="status_refresh">刷新状态</string>
     <string name="restart_home">重启小米桌面</string>

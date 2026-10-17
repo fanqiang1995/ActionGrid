@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <instrumentation
+        android:name=".NativeActionsProbe"
+        android:targetPackage="io.github.jiangjinyue2333.actiongrid" />
+</manifest>

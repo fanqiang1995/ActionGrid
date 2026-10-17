@@ -318,8 +318,8 @@ final class ActionController {
         int index = action - ActionIds.DYNAMIC_BASE;
         if (index >= 0 && index < cached.dynamicActions().size()
                 && index < ActionIds.DYNAMIC_COUNT) {
-            return record(host, "应用快捷操作",
-                    bridge.startDynamicAction(host, cached.dynamicActions().get(index)));
+            DynamicAction shortcut = cached.dynamicActions().get(index);
+            return record(host, shortcut.label(), bridge.startDynamicAction(host, shortcut));
         }
         return false;
     }
@@ -531,7 +531,7 @@ final class ActionController {
     private boolean record(View host, String event, boolean result) {
         DiagnosticsClient.record(host.getContext(), event + (result ? " 已触发" : " 触发失败"));
         if (!result) {
-            announce(host, "当前桌面版本不支持此操作");
+            announce(host, event + "不可用，请重新定位图标");
         }
         return true;
     }

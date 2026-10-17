@@ -4,6 +4,7 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.ActivityManager;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.Context;
@@ -13,6 +14,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.provider.Settings;
 import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -29,6 +31,7 @@ import java.util.concurrent.Executors;
 
 import io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsProvider;
 import io.github.jiangjinyue2333.actiongrid.diagnostics.LogStore;
+import io.github.jiangjinyue2333.actiongrid.hook.HyperOs4Compatibility;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateClient;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateDownloader;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateManifest;
@@ -48,6 +51,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private TextView moduleStatus;
     private TextView scopeStatus;
     private TextView homeStatus;
+    private TextView desktopProcessStatus;
     private TextView statusMessage;
     private TextView aboutStatus;
     private Button openAbout;
@@ -130,6 +134,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         moduleStatus = findViewById(R.id.module_status_value);
         scopeStatus = findViewById(R.id.scope_status_value);
         homeStatus = findViewById(R.id.home_status_value);
+        desktopProcessStatus = findViewById(R.id.desktop_process_status_value);
         statusMessage = findViewById(R.id.status_message);
         aboutStatus = findViewById(R.id.about_status);
         openAbout = findViewById(R.id.open_about);
@@ -164,6 +169,11 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     }
 
     private void confirmHomeRestart() {
+        PackageInfo homeInfo = installedHomeInfo();
+        if (isHyperOs4Home(homeInfo) && !isSupportedHyperOs4Home(homeInfo)) {
+            statusMessage.setText("当前澎湃 4 桌面版本未验证，已关闭原生动作；重启桌面无法解决此问题");
+            return;
+        }
         if (homeRestartInProgress) {
             return;
         }
@@ -240,8 +250,13 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     }
 
     private void refreshStatus() {
-        String home = installedHomeVersion();
+        PackageInfo homeInfo = installedHomeInfo();
+        boolean hyperOs4 = isHyperOs4Home(homeInfo);
+        String home = installedHomeVersion(homeInfo);
         setStatusRow(R.id.home_status_row, homeStatus, "小米桌面", home);
+        String process = launcherProcessStatus(List.of());
+        setStatusRow(R.id.desktop_process_status_row, desktopProcessStatus,
+                getString(R.string.desktop_process_label), process);
         if (service == null) {
             setStatusRow(R.id.module_status_row, moduleStatus, "模块", "libxposed 服务未连接");
             setStatusRow(R.id.scope_status_row, scopeStatus, "作用域", "无法读取");
@@ -250,14 +265,27 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         }
         try {
             int api = service.getApiVersion();
-            String module = api == 102 ? runningTargetStatus(service.getRunningTargets())
-                    : "框架 API " + api + "，需要 API 102";
+            List<HookedTarget> targets = api == 102 ? service.getRunningTargets() : List.of();
+            process = launcherProcessStatus(targets);
+            setStatusRow(R.id.desktop_process_status_row, desktopProcessStatus,
+                    getString(R.string.desktop_process_label), process);
             List<String> scope = service.getScope();
-            String scopeText = scope.size() == 1 && scope.contains(TARGET_PACKAGE)
-                    ? "仅小米桌面，已启用" : "当前范围：" + scope;
+            if (scope.contains("android")) {
+                service.removeScope(List.of("android"));
+                scope = service.getScope();
+            }
+            boolean homeScope = scope.contains(TARGET_PACKAGE);
+            String scopeText = homeScope ? "仅小米桌面，已启用" : "缺少小米桌面范围";
+            String running = runningTargetStatus(targets);
+            String module = api == 102
+                    ? hyperOs4 ? hyperOs4ActionStatus(homeInfo, homeScope, process)
+                    : running
+                    : "框架 API " + api + "，需要 API 102";
             setStatusRow(R.id.module_status_row, moduleStatus, "模块", module);
             setStatusRow(R.id.scope_status_row, scopeStatus, "作用域", scopeText);
-            statusMessage.setText(api == 102 ? module : "框架 API 不兼容");
+            statusMessage.setText(api != 102 ? "框架 API 不兼容"
+                    : hyperOs4 ? hyperOs4ActionMessage(homeInfo, homeScope, process)
+                    : module);
         } catch (RuntimeException exception) {
             setStatusRow(R.id.module_status_row, moduleStatus, "模块", "读取失败");
             statusMessage.setText("读取模块状态失败");
@@ -267,7 +295,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
 
     private String runningTargetStatus(List<HookedTarget> targets) {
         for (HookedTarget target : targets) {
-            if (TARGET_PACKAGE.equals(target.getProcessName())) {
+            if (isTargetProcess(target.getProcessName())) {
                 return target.getLoadedVersionCode() == BuildConfig.VERSION_CODE
                         ? "模块已加载" : "小米桌面仍在运行旧版模块";
             }
@@ -275,16 +303,112 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         return "小米桌面未运行或模块尚未加载";
     }
 
-    private String installedHomeVersion() {
+    private String launcherProcessStatus(List<HookedTarget> targets) {
+        if (targets != null) {
+            for (HookedTarget target : targets) {
+                if (isTargetProcess(target.getProcessName())) {
+                    return "运行中";
+                }
+            }
+        }
         try {
-            PackageInfo info = getPackageManager().getPackageInfo(
+            ActivityManager manager = getSystemService(ActivityManager.class);
+            if (manager != null) {
+                List<ActivityManager.RunningAppProcessInfo> processes =
+                        manager.getRunningAppProcesses();
+                if (processes != null) {
+                    for (ActivityManager.RunningAppProcessInfo process : processes) {
+                        if (isTargetProcess(process.processName)) {
+                            return "运行中";
+                        }
+                        if (process.pkgList != null) {
+                            for (String packageName : process.pkgList) {
+                                if (TARGET_PACKAGE.equals(packageName)) {
+                                    return "运行中";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (RuntimeException exception) {
+            LogStore.append(this, "app", "读取桌面进程状态失败 "
+                    + exception.getClass().getSimpleName());
+        }
+        return "无法确认";
+    }
+
+    private String hyperOs4ActionStatus(PackageInfo info, boolean homeScope, String process) {
+        if (!homeScope) {
+            return "澎湃 4 原生动作：未启用小米桌面作用域";
+        }
+        if (!isSupportedHyperOs4Home(info)) {
+            return "澎湃 4 原生动作：" + HyperOs4Compatibility.profileName(
+                    info == null ? 0L : info.getLongVersionCode()) + "不支持";
+        }
+        String profile = HyperOs4Compatibility.profileName(info.getLongVersionCode());
+        return switch (process) {
+            case "运行中" -> "澎湃 4 原生动作：" + profile
+                    + "，桌面进程运行，等待 native ABI 校验";
+            case "未运行" -> "澎湃 4 原生动作：" + profile + "，已启用，等待桌面进程";
+            default -> "澎湃 4 原生动作：" + profile
+                    + "，已识别，native ABI 状态无法确认";
+        };
+    }
+
+    private String hyperOs4ActionMessage(PackageInfo info, boolean homeScope, String process) {
+        if (!homeScope) {
+            return "澎湃 4 原生动作未启用：请勾选小米桌面作用域";
+        }
+        if (!isSupportedHyperOs4Home(info)) {
+            return "当前澎湃 4 桌面版本（"
+                    + HyperOs4Compatibility.profileName(
+                    info == null ? 0L : info.getLongVersionCode())
+                    + "）不在已验证 ABI 范围内，桌面动作已关闭";
+        }
+        String profile = HyperOs4Compatibility.profileName(info.getLongVersionCode());
+        return switch (process) {
+            case "运行中" -> "澎湃 4 原生动作（" + profile
+                    + "）已识别；native_init 完成 ABI 校验后可用，请再用 TalkBack 测试";
+            case "未运行" -> "澎湃 4 原生动作（" + profile + "）已启用；桌面进程启动后可用";
+            default -> "澎湃 4 原生动作（" + profile + "）已识别；正在确认 native ABI 状态";
+        };
+    }
+
+    private static boolean isSupportedHyperOs4Home(PackageInfo info) {
+        return isHyperOs4Home(info) && HyperOs4Compatibility.supports(
+                Build.VERSION.SDK_INT, info.getLongVersionCode(), false);
+    }
+
+    private static boolean isTargetProcess(String processName) {
+        return TARGET_PACKAGE.equals(processName)
+                || (processName != null && processName.startsWith(TARGET_PACKAGE + ":"));
+    }
+
+    private PackageInfo installedHomeInfo() {
+        try {
+            return getPackageManager().getPackageInfo(
                     TARGET_PACKAGE, PackageManager.PackageInfoFlags.of(0));
-            String family = info.versionName != null && info.versionName.startsWith("7.")
-                    ? "7.x 桥" : "4.x/兼容探测";
-            return "版本 " + info.versionName + "，" + family;
         } catch (PackageManager.NameNotFoundException exception) {
+            return null;
+        }
+    }
+
+    private static boolean isHyperOs4Home(PackageInfo info) {
+        return Build.VERSION.SDK_INT >= 37 && info != null && info.applicationInfo != null
+                && (info.applicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_HAS_CODE)
+                == 0;
+    }
+
+    private static String installedHomeVersion(PackageInfo info) {
+        if (info == null) {
             return "未安装";
         }
+        String family = isHyperOs4Home(info) ? "澎湃 4 原生桌面（"
+                + HyperOs4Compatibility.profileName(info.getLongVersionCode()) + "）"
+                : info.versionName != null && info.versionName.startsWith("7.")
+                ? "7.x Java 桥（自动）" : "4.x/兼容探测（自动）";
+        return "版本 " + info.versionName + "，" + family;
     }
 
     private void setStatusRow(int rowId, TextView valueView, String label, String value) {

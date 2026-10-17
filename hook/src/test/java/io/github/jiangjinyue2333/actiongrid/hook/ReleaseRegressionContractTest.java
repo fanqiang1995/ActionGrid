@@ -39,6 +39,7 @@ public final class ReleaseRegressionContractTest {
         assertTrue(loadShortcuts.contains("queryShortcuts(launcherApps, target, true)"));
         assertTrue(loadShortcuts.contains("queryShortcuts(launcherApps, target, false)"));
         assertTrue(loadShortcuts.contains("mergeShortcutResults"));
+        assertTrue(loadShortcuts.contains("FLAG_MATCH_PINNED"));
         assertFalse(loadShortcuts.contains("shortcuts = queryShortcuts"));
     }
 
@@ -292,6 +293,58 @@ public final class ReleaseRegressionContractTest {
 
         assertFalse(source.contains("host.createAccessibilityNodeInfo()"));
         assertTrue(source.contains("AccessibilityNodeInfo.obtain(host)"));
+    }
+
+    @Test
+    public void hyperOs4UsesNativePlacementWithJavaApplicationActions() throws IOException {
+        String module = source("ActionGridModule.java");
+        String adapter = source("HyperOs4NodeAdapter.java");
+        String gesture = source("HyperOs4GestureDispatcher.java");
+        String workspace = source("HyperOs4Workspace.java");
+
+        assertFalse(module.contains("onSystemServerStarting"));
+        assertTrue(module.contains("HyperOS 4 native profile"));
+        assertTrue(module.contains("HyperOs4NodeAdapter.installApplicationActions(this)"));
+        assertTrue(module.contains("isNativeCandidate"));
+        assertTrue(adapter.contains("android.view.AccessibilityInteractionController"));
+        assertTrue(adapter.contains("returnFindNodesResult"));
+        assertTrue(adapter.contains("performAccessibilityActionClientThread"));
+        assertTrue(adapter.contains("!synthetic && !isCustomAction(action)"));
+        assertTrue(adapter.contains("applicationActionsOnly &&"));
+        assertTrue(adapter.contains("isApplicationAction(action)"));
+        assertTrue(adapter.contains("startShortcut"));
+        assertTrue(adapter.contains("startAppDetailsActivity"));
+        assertTrue(adapter.contains("ComponentName.unflattenFromString"));
+        assertTrue(adapter.contains("Settings.ACTION_APPLICATION_DETAILS_SETTINGS"));
+        assertTrue(adapter.contains("applicationActionsOnly && action == ActionIds.UNINSTALL"));
+        assertTrue(adapter.contains("ShortcutQuery.FLAG_MATCH_DYNAMIC"));
+        assertTrue(adapter.contains("ShortcutQuery.FLAG_MATCH_PINNED"));
+        assertTrue(adapter.contains("MAX_SHORTCUT_LOAD_ATTEMPTS"));
+        assertFalse(adapter.contains("com.android.server"));
+        assertTrue(gesture.contains("activity.dispatchTouchEvent(event)"));
+        assertTrue(workspace.contains("resolver.query(FAVORITES_URI"));
+        assertTrue(workspace.contains("if (loaded == null)"));
+        assertTrue(workspace.contains("return null;"));
+        assertTrue(adapter.contains("dynamicActions(target.item().id())"));
+        assertTrue(adapter.contains("dynamicActions(node.item().id())"));
+        assertFalse(adapter.contains("dynamicActions(target.nodeId())"));
+        assertFalse(adapter.contains("dynamicActions(node.nodeId())"));
+        assertFalse(workspace.contains("resolver.insert("));
+        assertFalse(workspace.contains("resolver.update("));
+        assertFalse(workspace.contains("resolver.delete("));
+    }
+
+    @Test
+    public void hyperOs4UninstallUsesSystemInstallerForCurrentUser() throws IOException {
+        String adapter = source("HyperOs4NodeAdapter.java");
+        String uninstall = between(adapter, "private boolean startUninstall",
+                "private boolean startDynamicAction");
+
+        assertTrue(uninstall.contains("Intent.ACTION_DELETE"));
+        assertTrue(uninstall.contains("Intent.EXTRA_USER"));
+        assertTrue(uninstall.contains("Process.myUserHandle()"));
+        assertTrue(uninstall.contains("Intent.FLAG_ACTIVITY_NEW_TASK"));
+        assertFalse(uninstall.contains("deletePackage"));
     }
 
     private static String between(String source, String start, String end) {

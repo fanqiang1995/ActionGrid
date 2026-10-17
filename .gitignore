@@ -17,3 +17,9 @@ local.properties
 .idea/
 captures/
 external/
+/tmp/
+/.tmp*
+androguard.db
+*.png
+*.so
+/系统桌面/

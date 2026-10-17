@@ -11,8 +11,18 @@ android {
         applicationId = "io.github.jiangjinyue2333.actiongrid"
         minSdk = 34
         targetSdk = 37
-        versionCode = 15
-        versionName = "0.3"
+        versionCode = 16
+        versionName = "0.4"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/cpp/Android.mk")
+        }
     }
 
     buildTypes {

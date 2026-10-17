@@ -83,6 +83,7 @@ final class EmptyPositionAccessibilityProvider extends AccessibilityNodeProvider
             }
             return handled;
         }
+
         if (action == AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS) {
             if (accessibilityFocusedId == virtualViewId) {
                 return false;
@@ -103,7 +104,6 @@ final class EmptyPositionAccessibilityProvider extends AccessibilityNodeProvider
         }
         return false;
     }
-
     boolean dispatchHoverEvent(MotionEvent event) {
         AccessibilityManager manager = manager();
         if (manager == null || !manager.isTouchExplorationEnabled()) {
