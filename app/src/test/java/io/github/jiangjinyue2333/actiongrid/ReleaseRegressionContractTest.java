@@ -224,6 +224,26 @@ public final class ReleaseRegressionContractTest {
     }
 
     @Test
+    public void nativeUninstallSharesLauncherIdentityThroughOptionsBundle() throws IOException {
+        Path local = Path.of("src", "main", "cpp", "native_init.cpp");
+        Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
+        String nativeSource = Files.readString(path);
+        String uninstall = between(nativeSource, "bool startUninstall(", "// Layout is verified");
+        String iconActions = between(nativeSource, "void injectIconActions(void *node) {",
+                "void injectRecentActions(void *node) {");
+
+        assertTrue(nativeSource.contains("BundleInsertBooleanFn"));
+        assertTrue(nativeSource.contains("Bundle_insert_boolean"));
+        assertTrue(uninstall.contains("android:activity.shareIdentity"));
+        assertTrue(uninstall.contains("g_bundle_insert_boolean"));
+        assertTrue(uninstall.replaceAll("\\s+", " ").contains(
+                "g_scene_start_activity( scene, intent, 1, nullptr, 1, 0, -1, options"));
+        assertTrue(uninstall.contains("g_bundle_drop(options)"));
+        assertFalse(uninstall.contains("g_scene_start_activity(scene, intent, 1, nullptr"));
+        assertTrue(iconActions.contains("uninstallLaunchReady()"));
+    }
+
+    @Test
     public void nativeRecentsAnnouncementsAreSurfaceScoped() throws IOException {
         Path local = Path.of("src", "main", "cpp", "native_init.cpp");
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
@@ -493,6 +513,43 @@ public final class ReleaseRegressionContractTest {
     }
 
     @Test
+    public void nativeAbiUsesStructuralFingerprintAndSeparatesMoveCapability()
+            throws IOException {
+        Path local = Path.of("src", "main", "cpp", "native_init.cpp");
+        Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
+        String nativeSource = Files.readString(path);
+        String iconActions = between(nativeSource, "void injectIconActions(void *node) {",
+                "void injectRecentActions(void *node) {");
+        String placement = between(nativeSource, "bool performNativePlacement(",
+                "bool onPerformAction(");
+
+        assertTrue(nativeSource.contains("struct ElfFingerprint"));
+        assertTrue(nativeSource.contains("readModuleFingerprint"));
+        assertTrue(nativeSource.contains("CAP_MOVE_PROFILE"));
+        assertTrue(nativeSource.contains("fingerprintMatches"));
+        assertTrue(iconActions.contains("moveActionsReady()"));
+        assertTrue(placement.contains("CAP_MOVE_PROFILE"));
+        assertTrue(nativeSource.contains(".comment"));
+        assertTrue(nativeSource.contains("PT_NOTE"));
+    }
+
+    @Test
+    public void unknownMoveProfileKeepsLiftSafeAndHidesVirtualPlacement() throws IOException {
+        Path local = Path.of("src", "main", "cpp", "native_init.cpp");
+        Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
+        String nativeSource = Files.readString(path);
+
+        String virtualNode = between(nativeSource, "NodeResult makeVirtualNode(",
+                "NodeResult onFindFocus(");
+        String action = between(nativeSource, "void injectIconActions(void *node) {",
+                "void injectRecentActions(void *node) {");
+
+        assertTrue(virtualNode.contains("!moveActionsReady()"));
+        assertTrue(action.contains("if (lifted)"));
+        assertTrue(action.contains("lifted && !liftedSource && moveReady"));
+    }
+
+    @Test
     public void nativeDeviceProbeChecksLiftedPagingAndBothOccupiedMoveDirections()
             throws IOException {
         Path probeLocal = Path.of("src", "debug", "java", "io", "github",
@@ -512,6 +569,13 @@ public final class ReleaseRegressionContractTest {
         assertTrue(script.contains("-e action page-previous"));
         assertTrue(script.contains("-e action move-after"));
         assertTrue(script.contains("-e action move-before"));
+        assertTrue(script.contains("-e action uninstall"));
+        assertTrue(script.contains("-e inspect true"));
+        assertTrue(script.contains("-e icon QQ"));
+        assertTrue(script.contains("-e stay true -e action uninstall"));
+        assertTrue(script.contains("要卸载此应用吗？"));
+        assertTrue(script.contains("pm path com.tencent.mobileqq"));
+        assertTrue(probe.contains("if (!executed && (icons == 0 || directActions == 0))"));
     }
 
     private static String between(String source, String start, String end) {

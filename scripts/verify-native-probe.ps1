@@ -10,7 +10,9 @@ function Invoke-Adb {
 Invoke-Adb logcat -c | Out-Null
 $homePid = (Invoke-Adb shell pidof com.miui.home | Out-String).Trim()
 if ($homePid -match '^\d+$') { Invoke-Adb shell am force-stop com.miui.home | Out-Null }
+Invoke-Adb shell am force-stop com.tencent.mobileqq | Out-Null
 Invoke-Adb shell monkey -p com.miui.home 1 | Out-Null
+Invoke-Adb shell input keyevent 3 | Out-Null
 Start-Sleep -Seconds 8
 $homePid = (Invoke-Adb shell pidof com.miui.home | Out-String).Trim()
 if ($homePid -notmatch '^\d+$') { throw 'Xiaomi Home is not running as a single process.' }
@@ -22,10 +24,31 @@ if ($nativeLog -notmatch 'Launcher workspace reload symbol installed') {
     throw 'Launcher workspace reload entry point was not installed after Home restart.'
 }
 Start-Sleep -Seconds 3
-$lift = & adb -s $Serial shell am instrument -w -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
+$preheat = & adb -s $Serial shell am instrument -w -e inspect true `
+    -e icon QQ -e builtin 16 -e oneShot true io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
+if ($preheat -notmatch 'BUILTIN true') {
+    throw "Home Scene preheat failed: $preheat"
+}
+Invoke-Adb shell input keyevent 4 | Out-Null
+Start-Sleep -Seconds 1
+$uninstall = ''
+try {
+    $uninstall = & adb -s $Serial shell am instrument -w -e stay true -e action uninstall -e iconAlias qq `
+        -e expect '要卸载此应用吗？' io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
+    if ($uninstall -notmatch 'CALLBACK true' -or $uninstall -notmatch '要卸载此应用吗？' -or
+            $uninstall -notmatch 'PASS') {
+        throw "TalkBack uninstall confirmation probe failed: $uninstall"
+    }
+} finally {
+    Invoke-Adb shell input keyevent 4 | Out-Null
+}
+$qqPath = Invoke-Adb shell pm path com.tencent.mobileqq | Out-String
+if ($qqPath -notmatch 'package:') { throw 'QQ disappeared during the uninstall probe.' }
+
+$lift = & adb -s $Serial shell am instrument -w -e stay true -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
 if ($lift -notmatch 'CALLBACK true') {
     Start-Sleep -Seconds 1
-    $lift = & adb -s $Serial shell am instrument -w -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
+    $lift = & adb -s $Serial shell am instrument -w -e stay true -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
 }
 $probeFailed = ($lift -notmatch 'CALLBACK true') -or ($lift -notmatch 'PASS')
 if ($probeFailed) {
@@ -47,7 +70,7 @@ if (($moveAfter -notmatch 'CALLBACK true') -or ($moveAfter -notmatch 'placementC
     throw "Direct TalkBack move-after probe failed: $moveAfter"
 }
 
-$lift = & adb -s $Serial shell am instrument -w -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
+$lift = & adb -s $Serial shell am instrument -w -e stay true -e action lift -e iconAlias file io.github.jiangjinyue2333.actiongrid/.NativeActionsProbe | Out-String
 if (($lift -notmatch 'CALLBACK true') -or ($lift -notmatch 'PASS')) {
     throw "Second direct TalkBack lift probe failed: $lift"
 }

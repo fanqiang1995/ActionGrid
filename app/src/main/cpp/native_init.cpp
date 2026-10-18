@@ -53,6 +53,9 @@ constexpr uint32_t CAP_SELECTION_STATE = 1U << 10;
 constexpr uint32_t CAP_FRB_MODEL = 1U << 11;
 constexpr uint32_t CAP_PAGE_SCROLL_EVENT = 1U << 12;
 constexpr uint32_t CAP_SCENE_ACTIVITY = 1U << 13;
+// Movement is a separate capability: safe read-only/direct actions can stay
+// available when a launcher revision is structurally unknown.
+constexpr uint32_t CAP_MOVE_PROFILE = 1U << 14;
 
 constexpr int32_t kTypeViewScrolled = 4096;
 constexpr int32_t kTypeAnnouncement = 16384;
@@ -82,6 +85,45 @@ enum class LauncherAbiProfile : uint8_t {
     kCurrent8565,
 };
 
+struct ElfFingerprint {
+    uint64_t first = 0;
+    uint64_t second = 0;
+    bool valid = false;
+};
+
+struct KnownFingerprint {
+    uint64_t first;
+    uint64_t second;
+};
+
+// Filled from the checked-in ELF samples by scripts/verify-native-abi.ps1.
+// PT_NOTE/.comment bytes are excluded, so a Build ID-only rebuild keeps the
+// same structural fingerprint.
+constexpr KnownFingerprint kSystemPrivateFingerprint{
+        0x5b7a19c56d7704c7ULL, 0xf5c729612d74d0deULL};
+constexpr KnownFingerprint kLegacyAidlFingerprint{
+        0xd884584d8d3d6fb8ULL, 0xcd7b61ccbcf2dab1ULL};
+constexpr KnownFingerprint kCurrentAidlFingerprint{
+        0xdaf46dda4c2b40d4ULL, 0xceb378cc00132dc9ULL};
+constexpr KnownFingerprint kLegacyUiFingerprint{
+        0x06ad928995604d98ULL, 0xe150a44005597071ULL};
+constexpr KnownFingerprint kCurrentUiFingerprint{
+        0x0447f0269df2c72fULL, 0x98e52e43a1f1887aULL};
+constexpr KnownFingerprint kPublicFingerprint{
+        0xe3cc5ece19a86f19ULL, 0x68095ade224bb05bULL};
+constexpr KnownFingerprint kLegacy7653DartFingerprint{
+        0x5e31a8f53bfa5c95ULL, 0x66ff90acbeddc872ULL};
+constexpr KnownFingerprint kLegacy7722DartFingerprint{
+        0xefa1be7bb9c193ddULL, 0x27e1f5340ea701eULL};
+constexpr KnownFingerprint kCurrent8565DartFingerprint{
+        0xd8c9d91e0825e4adULL, 0x33c1b7c515f4d2faULL};
+constexpr KnownFingerprint kLegacy7653LauncherFingerprint{
+        0x0676d70c1d6227d6ULL, 0xe899ab4db826315eULL};
+constexpr KnownFingerprint kLegacy7722LauncherFingerprint{
+        0x6aafec65d595b957ULL, 0xd78ecbfd33f5b7afULL};
+constexpr KnownFingerprint kCurrent8565LauncherFingerprint{
+        0xd43e8de27a633a7eULL, 0x770a572f4b6ddfc6ULL};
+
 constexpr char kExpectedLegacyPrivateBuildId[] =
         "401af21eddb88554a568b61ef29fc138";
 constexpr char kExpectedLegacyAidlBuildId[] =
@@ -92,6 +134,12 @@ constexpr char kExpectedPrivateBuildId[] =
         "c3f3fc36f279d12dd70d69f328596457";
 constexpr char kExpectedAidlBuildId[] =
         "7de2dd3e204a267ee1ed57c7a54391d2";
+// HyperOS 4.0.4 refreshed the Rust Build IDs without changing the verified
+// private/AIDL symbol or layout ABI.
+constexpr char kExpectedRefreshedPrivateBuildId[] =
+        "9768c65ebc28df3b10059df4fae9bd7e";
+constexpr char kExpectedRefreshedAidlBuildId[] =
+        "0c593771414b630a523e548f33700e83";
 constexpr char kExpectedPublicBuildId[] =
         "e2ba6d4fbeb2a03e72cf5f016429d2e4";
 constexpr char kExpectedUiBuildId[] =
@@ -124,6 +172,7 @@ constexpr char kSendEventSymbol[] =
 
 std::atomic<uint32_t> g_capabilities{0};
 std::atomic<LauncherAbiProfile> g_launcher_profile{LauncherAbiProfile::kUnknown};
+std::atomic<bool> g_launcher_fingerprint_ready{false};
 std::atomic<bool> g_current_frb_move_profile{false};
 std::atomic<uint32_t> g_node_action_calls{0};
 std::atomic<uint32_t> g_custom_action_calls{0};
@@ -460,6 +509,7 @@ using UserHandleSetFn = void (*)(void *, int32_t);
 using UserHandleDropFn = void (*)(void *);
 using BundleDefaultFn = void *(*)();
 using BundleDropFn = void (*)(void *);
+using BundleInsertBooleanFn = void (*)(void *, const RustRString *, bool);
 using BundleInsertI32Fn = void (*)(void *, const RustRString *, int32_t);
 using BundleInsertStringFn = void (*)(void *, const RustRString *, const RustOptionString *);
 using ComponentNameNewFn = void *(*)(const char *, size_t, const char *, size_t);
@@ -520,6 +570,7 @@ UserHandleSetFn g_user_handle_set = nullptr;
 UserHandleDropFn g_user_handle_drop = nullptr;
 BundleDefaultFn g_bundle_default = nullptr;
 BundleDropFn g_bundle_drop = nullptr;
+BundleInsertBooleanFn g_bundle_insert_boolean = nullptr;
 BundleInsertI32Fn g_bundle_insert_i32 = nullptr;
 BundleInsertStringFn g_bundle_insert_string = nullptr;
 ComponentNameNewFn g_component_name_new = nullptr;
@@ -668,26 +719,21 @@ bool workspaceReloadPrologueMatches(void *target) {
 
 LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
         LauncherAbiProfile profile, const char *buildId) {
-    const char *expectedBuildId = nullptr;
     uintptr_t offset = 0;
     switch (profile) {
         case LauncherAbiProfile::kLegacy7653:
-            expectedBuildId = kExpectedPreviousLauncherDartBuildId;
             offset = 0x7a1660;
             break;
         case LauncherAbiProfile::kLegacy7722:
-            expectedBuildId = kExpectedLauncherDartBuildId;
             offset = 0x7a2008;
             break;
         case LauncherAbiProfile::kCurrent8565:
-            expectedBuildId = kExpectedCurrentLauncherDartBuildId;
             offset = 0x7aa050;
             break;
         case LauncherAbiProfile::kUnknown:
             return nullptr;
     }
-    if (buildId == nullptr || expectedBuildId == nullptr
-            || std::strcmp(buildId, expectedBuildId) != 0) {
+    if (!g_launcher_fingerprint_ready.load(std::memory_order_acquire)) {
         return nullptr;
     }
     void *base = launcherLibraryBase();
@@ -767,6 +813,308 @@ bool readBuildId(const char *moduleName, char *output, size_t outputSize) {
         return 0;
     }, &search);
     return search.found;
+}
+
+bool appendElfRange(std::vector<std::pair<uint64_t, uint64_t>> &ranges,
+        uint64_t start, uint64_t size, size_t fileSize) {
+    if (size == 0) return true;
+    if (start > static_cast<uint64_t>(fileSize)
+            || size > static_cast<uint64_t>(fileSize) - start) {
+        return false;
+    }
+    ranges.emplace_back(start, start + size);
+    return true;
+}
+
+bool fingerprintElfBytes(const std::vector<uint8_t> &bytes, ElfFingerprint &output) {
+    output = {};
+    if (bytes.size() < sizeof(ElfW(Ehdr))) return false;
+
+    ElfW(Ehdr) header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    if (header.e_ident[EI_MAG0] != ELFMAG0
+            || header.e_ident[EI_MAG1] != ELFMAG1
+            || header.e_ident[EI_MAG2] != ELFMAG2
+            || header.e_ident[EI_MAG3] != ELFMAG3
+            || header.e_ident[EI_CLASS] != ELFCLASS64
+            || header.e_ident[EI_DATA] != ELFDATA2LSB
+            || header.e_phentsize != sizeof(ElfW(Phdr))) {
+        return false;
+    }
+    const uint64_t phdrBytes = static_cast<uint64_t>(header.e_phnum)
+            * static_cast<uint64_t>(header.e_phentsize);
+    if (header.e_phoff > bytes.size() || phdrBytes > bytes.size() - header.e_phoff) {
+        return false;
+    }
+
+    std::vector<ElfW(Phdr)> programs(header.e_phnum);
+    for (size_t index = 0; index < programs.size(); ++index) {
+        std::memcpy(&programs[index], bytes.data() + header.e_phoff
+                + index * sizeof(ElfW(Phdr)), sizeof(ElfW(Phdr)));
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> excluded;
+    for (const ElfW(Phdr) &program : programs) {
+        if (program.p_type == PT_NOTE
+                && !appendElfRange(excluded, program.p_offset, program.p_filesz,
+                        bytes.size())) {
+            return false;
+        }
+    }
+
+    // Some toolchains put .comment/.note.* inside a load segment. Exclude
+    // those sections as well; Build ID and compiler metadata are not ABI.
+    if (header.e_shoff != 0 && header.e_shnum != 0
+            && header.e_shentsize == sizeof(ElfW(Shdr))) {
+        const uint64_t sectionBytes = static_cast<uint64_t>(header.e_shnum)
+                * static_cast<uint64_t>(header.e_shentsize);
+        if (header.e_shoff > bytes.size() || sectionBytes > bytes.size() - header.e_shoff
+                || header.e_shstrndx >= header.e_shnum) {
+            return false;
+        }
+        std::vector<ElfW(Shdr)> sections(header.e_shnum);
+        for (size_t index = 0; index < sections.size(); ++index) {
+            std::memcpy(&sections[index], bytes.data() + header.e_shoff
+                    + index * sizeof(ElfW(Shdr)), sizeof(ElfW(Shdr)));
+        }
+        const ElfW(Shdr) &namesSection = sections[header.e_shstrndx];
+        if (namesSection.sh_offset > bytes.size()
+                || namesSection.sh_size > bytes.size() - namesSection.sh_offset) {
+            return false;
+        }
+        const char *names = reinterpret_cast<const char *>(
+                bytes.data() + namesSection.sh_offset);
+        const size_t namesSize = static_cast<size_t>(namesSection.sh_size);
+        for (const ElfW(Shdr) &section : sections) {
+            if (section.sh_name >= namesSize) return false;
+            const char *name = names + section.sh_name;
+            const size_t remaining = namesSize - section.sh_name;
+            if (std::memchr(name, '\0', remaining) == nullptr) return false;
+            if ((std::strncmp(name, ".note.", 6) == 0
+                    || std::strcmp(name, ".comment") == 0)
+                    && !appendElfRange(excluded, section.sh_offset, section.sh_size,
+                            bytes.size())) {
+                return false;
+            }
+        }
+    }
+
+    uint64_t first = 14695981039346656037ULL;
+    uint64_t second = 1099511628211ULL;
+    auto updateByte = [&first, &second](uint8_t value) {
+        first = (first ^ value) * 1099511628211ULL;
+        second = (second ^ static_cast<uint8_t>(value ^ 0xa5U)) * 1099511628211ULL;
+    };
+    auto updateWord = [&updateByte](uint64_t value) {
+        for (unsigned int shift = 0; shift < 64; shift += 8U) {
+            updateByte(static_cast<uint8_t>((value >> shift) & 0xffU));
+        }
+    };
+    updateByte('A');
+    updateByte('G');
+    updateByte('E');
+    updateByte('L');
+    updateByte('F');
+    updateByte(1U);
+    updateWord(static_cast<uint64_t>(header.e_type));
+    updateWord(static_cast<uint64_t>(header.e_machine));
+
+    uint64_t loadCount = 0;
+    for (const ElfW(Phdr) &program : programs) {
+        if (program.p_type != PT_LOAD) continue;
+        if (program.p_offset > bytes.size()
+                || program.p_filesz > bytes.size() - program.p_offset) {
+            return false;
+        }
+        updateByte(0x4cU);
+        updateWord(program.p_offset);
+        updateWord(program.p_filesz);
+        updateWord(program.p_memsz);
+        updateWord(program.p_flags);
+        updateWord(program.p_align);
+        const uint64_t start = program.p_offset;
+        const uint64_t end = start + program.p_filesz;
+        uint64_t position = start;
+        while (position < end) {
+            uint64_t next = end;
+            bool skip = false;
+            for (const auto &range : excluded) {
+                if (position >= range.first && position < range.second) {
+                    skip = true;
+                    next = std::min(next, range.second);
+                } else if (range.first > position && range.first < next) {
+                    next = range.first;
+                }
+            }
+            if (next <= position) return false;
+            if (!skip) {
+                for (uint64_t index = position; index < next; ++index) {
+                    updateByte(bytes[static_cast<size_t>(index)]);
+                }
+            }
+            position = next;
+        }
+        ++loadCount;
+    }
+    if (loadCount == 0) return false;
+    updateWord(loadCount);
+    output = {first, second, true};
+    return true;
+}
+
+uint16_t zipU16(const uint8_t *bytes) {
+    return static_cast<uint16_t>(bytes[0])
+            | static_cast<uint16_t>(bytes[1]) << 8U;
+}
+
+uint32_t zipU32(const uint8_t *bytes) {
+    return static_cast<uint32_t>(bytes[0])
+            | static_cast<uint32_t>(bytes[1]) << 8U
+            | static_cast<uint32_t>(bytes[2]) << 16U
+            | static_cast<uint32_t>(bytes[3]) << 24U;
+}
+
+bool readZipStoredEntry(const char *zipPath, const char *entryName,
+        std::vector<uint8_t> &output) {
+    output.clear();
+    FILE *file = std::fopen(zipPath, "rb");
+    if (file == nullptr || std::fseek(file, 0, SEEK_END) != 0) {
+        if (file != nullptr) std::fclose(file);
+        return false;
+    }
+    long length = std::ftell(file);
+    if (length < 22) {
+        std::fclose(file);
+        return false;
+    }
+    const size_t tailSize = std::min<size_t>(static_cast<size_t>(length), 0xffffU + 22U);
+    if (std::fseek(file, length - static_cast<long>(tailSize), SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    std::vector<uint8_t> tail(tailSize);
+    if (std::fread(tail.data(), 1, tail.size(), file) != tail.size()) {
+        std::fclose(file);
+        return false;
+    }
+    size_t eocd = tail.size();
+    while (eocd >= 22U) {
+        --eocd;
+        if (zipU32(tail.data() + eocd) == 0x06054b50U) break;
+    }
+    if (eocd == tail.size()) {
+        std::fclose(file);
+        return false;
+    }
+    const uint32_t centralSize = zipU32(tail.data() + eocd + 12U);
+    const uint32_t centralOffset = zipU32(tail.data() + eocd + 16U);
+    if (static_cast<uint64_t>(centralOffset) + centralSize
+            > static_cast<uint64_t>(length)
+            || std::fseek(file, centralOffset, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    std::vector<uint8_t> central(centralSize);
+    if (std::fread(central.data(), 1, central.size(), file) != central.size()) {
+        std::fclose(file);
+        return false;
+    }
+    const size_t wantedLength = std::strlen(entryName);
+    size_t cursor = 0;
+    while (cursor + 46U <= central.size()
+            && zipU32(central.data() + cursor) == 0x02014b50U) {
+        const uint16_t method = zipU16(central.data() + cursor + 10U);
+        const uint32_t compressedSize = zipU32(central.data() + cursor + 20U);
+        const uint32_t uncompressedSize = zipU32(central.data() + cursor + 24U);
+        const uint16_t nameLength = zipU16(central.data() + cursor + 28U);
+        const uint16_t extraLength = zipU16(central.data() + cursor + 30U);
+        const uint16_t commentLength = zipU16(central.data() + cursor + 32U);
+        const uint32_t localOffset = zipU32(central.data() + cursor + 42U);
+        const size_t recordSize = 46U + nameLength + extraLength + commentLength;
+        if (cursor + recordSize > central.size()) break;
+        const char *name = reinterpret_cast<const char *>(
+                central.data() + cursor + 46U);
+        if (nameLength == wantedLength
+                && std::memcmp(name, entryName, wantedLength) == 0) {
+            if (method != 0 || compressedSize != uncompressedSize
+                    || std::fseek(file, localOffset, SEEK_SET) != 0) {
+                std::fclose(file);
+                return false;
+            }
+            uint8_t localHeader[30]{};
+            if (std::fread(localHeader, 1, sizeof(localHeader), file) != sizeof(localHeader)
+                    || zipU32(localHeader) != 0x04034b50U) {
+                std::fclose(file);
+                return false;
+            }
+            const uint16_t localNameLength = zipU16(localHeader + 26U);
+            const uint16_t localExtraLength = zipU16(localHeader + 28U);
+            const uint64_t dataOffset = static_cast<uint64_t>(localOffset) + 30U
+                    + localNameLength + localExtraLength;
+            if (dataOffset + compressedSize > static_cast<uint64_t>(length)
+                    || std::fseek(file, static_cast<long>(dataOffset), SEEK_SET) != 0) {
+                std::fclose(file);
+                return false;
+            }
+            output.resize(compressedSize);
+            const bool read = std::fread(output.data(), 1, output.size(), file)
+                    == output.size();
+            std::fclose(file);
+            return read;
+        }
+        cursor += recordSize;
+    }
+    std::fclose(file);
+    return false;
+}
+
+bool readElfFingerprint(const char *path, ElfFingerprint &output) {
+    output = {};
+    if (path == nullptr || path[0] == '\0') return false;
+    const char *zipMarker = std::strstr(path, "!/");
+    std::vector<uint8_t> bytes;
+    if (zipMarker != nullptr) {
+        const std::string zipPath(path, static_cast<size_t>(zipMarker - path));
+        if (!readZipStoredEntry(zipPath.c_str(), zipMarker + 2, bytes)) return false;
+        return fingerprintElfBytes(bytes, output);
+    }
+    FILE *file = std::fopen(path, "rb");
+    if (file == nullptr || std::fseek(file, 0, SEEK_END) != 0) {
+        if (file != nullptr) std::fclose(file);
+        return false;
+    }
+    long length = std::ftell(file);
+    if (length <= 0 || std::fseek(file, 0, SEEK_SET) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    bytes.resize(static_cast<size_t>(length));
+    const bool read = std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    std::fclose(file);
+    return read && fingerprintElfBytes(bytes, output);
+}
+
+bool readModuleFingerprint(const char *moduleName, ElfFingerprint &output) {
+    output = {};
+    if (moduleName == nullptr) return false;
+    struct Search {
+        const char *name;
+        ElfFingerprint *output;
+        bool found;
+    } search{baseName(moduleName), &output, false};
+    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *opaque) {
+        auto *search = static_cast<Search *>(opaque);
+        if (search->found || info->dlpi_name == nullptr
+                || std::strcmp(baseName(info->dlpi_name), search->name) != 0) {
+            return 0;
+        }
+        search->found = readElfFingerprint(info->dlpi_name, *search->output);
+        return search->found ? 1 : 0;
+    }, &search);
+    return search.found;
+}
+
+bool fingerprintMatches(const ElfFingerprint &actual, KnownFingerprint expected) {
+    return actual.valid && actual.first == expected.first && actual.second == expected.second;
 }
 
 void resolvePrivate(const char *name, void *handle);
@@ -1235,6 +1583,23 @@ LauncherAbiProfile launcherAbiProfileForBuildId(const char *buildId) {
     return LauncherAbiProfile::kUnknown;
 }
 
+LauncherAbiProfile launcherAbiProfileForFingerprint(
+        const ElfFingerprint &dart, const ElfFingerprint &launcher) {
+    if (fingerprintMatches(dart, kLegacy7653DartFingerprint)
+            && fingerprintMatches(launcher, kLegacy7653LauncherFingerprint)) {
+        return LauncherAbiProfile::kLegacy7653;
+    }
+    if (fingerprintMatches(dart, kLegacy7722DartFingerprint)
+            && fingerprintMatches(launcher, kLegacy7722LauncherFingerprint)) {
+        return LauncherAbiProfile::kLegacy7722;
+    }
+    if (fingerprintMatches(dart, kCurrent8565DartFingerprint)
+            && fingerprintMatches(launcher, kCurrent8565LauncherFingerprint)) {
+        return LauncherAbiProfile::kCurrent8565;
+    }
+    return LauncherAbiProfile::kUnknown;
+}
+
 const char *launcherAbiProfileName(LauncherAbiProfile profile) {
     switch (profile) {
         case LauncherAbiProfile::kLegacy7653: return "8.01.02.7653";
@@ -1251,12 +1616,14 @@ bool isLegacyLauncherProfile(LauncherAbiProfile profile) {
 }
 
 bool matchesLauncherDartBuildId(const char *buildId) {
-    return launcherAbiProfileForBuildId(buildId) != LauncherAbiProfile::kUnknown;
+    (void) buildId;
+    return g_launcher_fingerprint_ready.load(std::memory_order_acquire);
 }
 
 bool matchesLauncherMotionBuildId(const char *buildId) {
     // Motion/freeform offsets were only verified for the two legacy profiles.
-    return isLegacyLauncherProfile(launcherAbiProfileForBuildId(buildId));
+    (void) buildId;
+    return isLegacyLauncherProfile(g_launcher_profile.load(std::memory_order_acquire));
 }
 
 bool matchesFrbModelBuildId(const char *buildId) {
@@ -1266,38 +1633,76 @@ bool matchesFrbModelBuildId(const char *buildId) {
 
 LauncherAbiProfile refreshLauncherAbiProfile(char *buildId, size_t buildIdSize) {
     if (buildId != nullptr && buildIdSize > 0) buildId[0] = '\0';
+    const LauncherAbiProfile cached = g_launcher_profile.load(std::memory_order_acquire);
+    if (cached != LauncherAbiProfile::kUnknown
+            && g_launcher_fingerprint_ready.load(std::memory_order_acquire)) {
+        if (buildId != nullptr && buildIdSize > 0) {
+            readBuildId("libapp.so", buildId, buildIdSize);
+        }
+        return cached;
+    }
     LauncherAbiProfile profile = LauncherAbiProfile::kUnknown;
     if (buildId != nullptr && buildIdSize > 0
             && readBuildId("libapp.so", buildId, buildIdSize)) {
-        profile = launcherAbiProfileForBuildId(buildId);
+        ElfFingerprint dartFingerprint{};
+        ElfFingerprint launcherFingerprint{};
+        if (readModuleFingerprint("libapp.so", dartFingerprint)
+                && readModuleFingerprint("libapp_launcher.so", launcherFingerprint)) {
+            profile = launcherAbiProfileForFingerprint(dartFingerprint, launcherFingerprint);
+        }
     }
     g_launcher_profile.store(profile, std::memory_order_release);
+    g_launcher_fingerprint_ready.store(profile != LauncherAbiProfile::kUnknown,
+            std::memory_order_release);
     g_current_frb_move_profile.store(profile == LauncherAbiProfile::kCurrent8565,
             std::memory_order_release);
-    g_capabilities.fetch_and(~CAP_FRB_MODEL, std::memory_order_release);
+    g_trigger_workspace_reload = nullptr;
+    g_capabilities.fetch_and(~(CAP_FRB_MODEL | CAP_MOVE_PROFILE),
+            std::memory_order_release);
     if (profile != LauncherAbiProfile::kUnknown && g_frb_dispatcher != nullptr) {
         g_capabilities.fetch_or(CAP_FRB_MODEL, std::memory_order_release);
     }
     __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-            "Launcher ABI profile=%s build=%s frb_model=%d",
+            "Launcher ABI profile=%s build=%s fingerprint=%d frb_model=%d",
             launcherAbiProfileName(profile), buildId == nullptr ? "" : buildId,
+            profile != LauncherAbiProfile::kUnknown ? 1 : 0,
             (g_capabilities.load(std::memory_order_acquire) & CAP_FRB_MODEL) != 0 ? 1 : 0);
     return profile;
 }
 
 bool profileMatchesSystemAbi(LauncherAbiProfile profile,
-        const char *privateId, const char *aidlId, const char *uiId) {
+        const char *privateId, const char *aidlId, const char *uiId,
+        const ElfFingerprint &privateFingerprint,
+        const ElfFingerprint &aidlFingerprint,
+        const ElfFingerprint &uiFingerprint) {
+    (void) privateId;
+    (void) aidlId;
+    (void) uiId;
+    if (!fingerprintMatches(privateFingerprint, kSystemPrivateFingerprint)) return false;
     if (profile == LauncherAbiProfile::kCurrent8565) {
-        return std::strcmp(privateId, kExpectedPrivateBuildId) == 0
-                && std::strcmp(aidlId, kExpectedAidlBuildId) == 0
-                && std::strcmp(uiId, kExpectedUiBuildId) == 0;
+        return fingerprintMatches(aidlFingerprint, kCurrentAidlFingerprint)
+                && fingerprintMatches(uiFingerprint, kCurrentUiFingerprint);
     }
     if (isLegacyLauncherProfile(profile)) {
-        return std::strcmp(privateId, kExpectedLegacyPrivateBuildId) == 0
-                && std::strcmp(aidlId, kExpectedLegacyAidlBuildId) == 0
-                && std::strcmp(uiId, kExpectedLegacyUiBuildId) == 0;
+        return fingerprintMatches(aidlFingerprint, kLegacyAidlFingerprint)
+                && fingerprintMatches(uiFingerprint, kLegacyUiFingerprint);
     }
     return false;
+}
+
+bool moveActionsReady() {
+    constexpr uint32_t kRequired = CAP_MOVE_PROFILE | CAP_PRIVATE_BUILD_MATCH
+            | CAP_PRIVATE_SYMBOLS;
+    return (g_capabilities.load(std::memory_order_acquire) & kRequired) == kRequired;
+}
+
+bool uninstallLaunchReady() {
+    return g_scene_start_activity != nullptr && g_intent_default != nullptr
+            && g_intent_set_action != nullptr && g_intent_set_component != nullptr
+            && g_intent_set_extras != nullptr && g_component_name_new != nullptr
+            && g_component_name_drop != nullptr && g_bundle_default != nullptr
+            && g_bundle_drop != nullptr && g_bundle_insert_boolean != nullptr
+            && g_bundle_insert_string != nullptr && g_rstring_from_utf16 != nullptr;
 }
 
 bool loadFavoritePlacements(const std::vector<int64_t> &ids,
@@ -1822,12 +2227,7 @@ bool startAppInfo(const AppTarget &target) {
 bool startUninstall(const AppTarget &target) {
     void *scene = g_scene_instance.load(std::memory_order_acquire);
     if (!sceneActivityAllowed() || scene == nullptr || target.user != 0
-            || target.package.empty() || g_scene_start_activity == nullptr
-            || g_intent_default == nullptr || g_intent_set_action == nullptr
-            || g_intent_set_component == nullptr || g_intent_set_extras == nullptr
-            || g_component_name_new == nullptr || g_bundle_default == nullptr
-            || g_bundle_drop == nullptr || g_bundle_insert_string == nullptr
-            || g_rstring_from_utf16 == nullptr) {
+            || target.package.empty() || !uninstallLaunchReady()) {
         return false;
     }
     void *intent = g_intent_default();
@@ -1837,9 +2237,11 @@ bool startUninstall(const AppTarget &target) {
             "io.github.jiangjinyue2333.actiongrid.WeChatShortcutActivity",
             sizeof("io.github.jiangjinyue2333.actiongrid.WeChatShortcutActivity") - 1);
     void *bundle = g_bundle_default();
-    if (intent == nullptr || component == nullptr || bundle == nullptr) {
+    void *options = g_bundle_default();
+    if (intent == nullptr || component == nullptr || bundle == nullptr || options == nullptr) {
         if (component != nullptr) g_component_name_drop(component);
         if (bundle != nullptr) g_bundle_drop(bundle);
+        if (options != nullptr) g_bundle_drop(options);
         return false;
     }
     auto putString = [bundle](const char *key, const std::string &value) {
@@ -1857,10 +2259,21 @@ bool startUninstall(const AppTarget &target) {
     RustOptionString actionName{0, {}, g_rstring_from_utf16(
             reinterpret_cast<const uint16_t *>(actionText.data()), actionText.size())};
     putString("io.github.jiangjinyue2333.actiongrid.EXTRA_PACKAGE", target.package);
+    std::u16string shareIdentityText = utf16FromUtf8(
+            "android:activity.shareIdentity");
+    RustRString shareIdentityKey = g_rstring_from_utf16(
+            reinterpret_cast<const uint16_t *>(shareIdentityText.data()),
+            shareIdentityText.size());
+    g_bundle_insert_boolean(options, &shareIdentityKey, true);
     g_intent_set_action(intent, &actionName);
     g_intent_set_extras(intent, bundle);
     g_intent_set_component(intent, component);
-    RustResult48 result = g_scene_start_activity(scene, intent, 1, nullptr, 1, 0, -1, nullptr);
+    // Scene_start_activity's public ABI carries the options Bundle in x7;
+    // x3 is the optional launch token and stays empty for this trampoline.
+    RustResult48 result = g_scene_start_activity(
+            scene, intent, 1, nullptr, 1, 0, -1, options);
+    // Scene_start_activity borrows the options Bundle; release it after the call.
+    g_bundle_drop(options);
     __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
             "uninstall trampoline package=%s result=%d", target.package.c_str(),
             nodeField<int32_t>(result.data, 8));
@@ -2446,7 +2859,7 @@ void handleRecentSwipeMotion(int32_t action, float x, float y) {
 }
 
 void updateTouchExplorationTarget(int32_t action, float x, float y) {
-    if (!g_lifted.load(std::memory_order_acquire)) return;
+    if (!g_lifted.load(std::memory_order_acquire) || !moveActionsReady()) return;
     constexpr int32_t kActionHoverMove = 7;
     constexpr int32_t kActionHoverEnter = 9;
     constexpr int32_t kActionHoverExit = 10;
@@ -2559,7 +2972,7 @@ void setNodeString(NodeSetStringFn setter, void *node, const char16_t *text) {
 
 NodeResult makeVirtualNode(int32_t nodeId) {
     NodeResult result{1U, nullptr};
-    if (g_node_new == nullptr || !isVirtualNode(nodeId)) return result;
+    if (g_node_new == nullptr || !isVirtualNode(nodeId) || !moveActionsReady()) return result;
     void *node = g_node_new();
     if (node == nullptr) return result;
     int32_t slot = nodeId - kVirtualNodeBase;
@@ -2648,7 +3061,7 @@ NodeResult makeVirtualNode(int32_t nodeId) {
 NodeResult onFindFocus(void *provider, int32_t focusType) {
     constexpr int32_t kAccessibilityFocus = 2;
     if (focusType == kAccessibilityFocus
-            && g_lifted.load(std::memory_order_acquire)) {
+            && g_lifted.load(std::memory_order_acquire) && moveActionsReady()) {
         int32_t focused = g_virtual_focused_id.load(std::memory_order_acquire);
         if (isVirtualNode(focused)) return makeVirtualNode(focused);
     }
@@ -2657,7 +3070,8 @@ NodeResult onFindFocus(void *provider, int32_t focusType) {
 }
 
 NodeResult onCreateNode(void *provider, int32_t nodeId) {
-    if (isVirtualNode(nodeId) && g_lifted.load(std::memory_order_acquire)) {
+    if (isVirtualNode(nodeId) && g_lifted.load(std::memory_order_acquire)
+            && moveActionsReady()) {
         return makeVirtualNode(nodeId);
     }
     NodeResult result = g_original_create_node == nullptr
@@ -2693,6 +3107,7 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
             && nodeBounds.right > nodeBounds.left && nodeBounds.bottom > nodeBounds.top;
     if ((result.absent & 1U) == 0 && result.node != nullptr
             && g_lifted.load(std::memory_order_acquire)
+            && moveActionsReady()
             && (visibleScreenContent
                     || nodeId == g_drop_parent_node_id.load(std::memory_order_acquire))
             && g_node_add_child != nullptr) {
@@ -3592,16 +4007,20 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     bool alreadyRunning = g_model_move_running.load(std::memory_order_acquire);
     const bool frbModelReady = g_frb_dispatcher != nullptr
             && (capabilities & CAP_FRB_MODEL) != 0;
+    const bool moveProfileReady = (capabilities & CAP_MOVE_PROFILE) != 0;
     const bool privateAbiReady = (capabilities & (CAP_PRIVATE_BUILD_MATCH
             | CAP_PRIVATE_SYMBOLS)) == (CAP_PRIVATE_BUILD_MATCH | CAP_PRIVATE_SYMBOLS);
-    if (actionId == kCreateFolderAction || !frbModelReady || !privateAbiReady
+    if (actionId == kCreateFolderAction || !moveProfileReady || !frbModelReady
+            || !privateAbiReady
             || alreadyRunning) {
         __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                "HyperOS4 placement rejected node=%d action=%d dispatcher=%p frb=%d private=%d running=%d",
+                "HyperOS4 placement rejected node=%d action=%d dispatcher=%p move=%d frb=%d private=%d running=%d",
                 nodeId, actionId, g_frb_dispatcher,
-                frbModelReady ? 1 : 0, privateAbiReady ? 1 : 0,
+                moveProfileReady ? 1 : 0, frbModelReady ? 1 : 0,
+                privateAbiReady ? 1 : 0,
                 alreadyRunning ? 1 : 0);
-        if ((!frbModelReady || !privateAbiReady) && actionId != kCreateFolderAction) {
+        if ((!moveProfileReady || !frbModelReady || !privateAbiReady)
+                && actionId != kCreateFolderAction) {
             sendAnnouncement(nodeId, "当前系统移动路径不可用");
         }
         return false;
@@ -3909,6 +4328,7 @@ void resolveLauncherApis(void *handle) {
     RESOLVE_NATIVE(g_user_handle_drop, UserHandleDropFn, "UserHandle_drop");
     RESOLVE_NATIVE(g_bundle_default, BundleDefaultFn, "Bundle_default");
     RESOLVE_NATIVE(g_bundle_drop, BundleDropFn, "Bundle_drop");
+    RESOLVE_NATIVE(g_bundle_insert_boolean, BundleInsertBooleanFn, "Bundle_insert_boolean");
     RESOLVE_NATIVE(g_bundle_insert_i32, BundleInsertI32Fn, "Bundle_insert_i32");
     RESOLVE_NATIVE(g_bundle_insert_string, BundleInsertStringFn, "Bundle_insert_string");
     RESOLVE_NATIVE(g_component_name_new, ComponentNameNewFn, "ComponentName_new");
@@ -4007,13 +4427,12 @@ void resolveLauncherApis(void *handle) {
     char dartBuildId[33] = {};
     LauncherAbiProfile profile = refreshLauncherAbiProfile(
             dartBuildId, sizeof(dartBuildId));
-    bool dartBuildMatch = matchesLauncherMotionBuildId(dartBuildId);
+    bool motionBuildMatch = matchesLauncherMotionBuildId(dartBuildId);
     bool frbBuildMatch = profile != LauncherAbiProfile::kUnknown
             && matchesFrbModelBuildId(dartBuildId);
-    bool motionBuildMatch = dartBuildMatch;
     g_launcher_start_freeform = nullptr;
     g_launcher_launch_sosc = nullptr;
-    if (dartBuildMatch) {
+    if (motionBuildMatch) {
         void *base = launcherLibraryBase();
         if (base != nullptr) {
             constexpr uintptr_t kLauncherStartFreeformOffset = 0x8f0440;
@@ -4030,7 +4449,7 @@ void resolveLauncherApis(void *handle) {
             && g_motion_raw_y != nullptr) {
         // This is the verified HyperOS 4 libapp_launcher/libapp pair. The Rust
         // local symbol is not exported, so keep the offset behind the paired
-        // libapp Build ID gate and never use it for another launcher build.
+        // ELF fingerprint gate and never use it for another launcher build.
         constexpr uintptr_t kLauncherMotionV2Offset = 0xd40fd8;
         void *base = launcherLibraryBase();
         void *target = base == nullptr ? nullptr
@@ -4049,47 +4468,63 @@ void resolveLauncherApis(void *handle) {
         }
     }
     g_trigger_workspace_reload = resolveWorkspaceReloadForProfile(profile, dartBuildId);
+    g_capabilities.fetch_and(~(CAP_FRB_MODEL | CAP_MOVE_PROFILE),
+            std::memory_order_release);
     if (g_frb_dispatcher != nullptr && frbBuildMatch) {
         g_capabilities.fetch_or(CAP_FRB_MODEL, std::memory_order_release);
+        if (g_trigger_workspace_reload != nullptr) {
+            g_capabilities.fetch_or(CAP_MOVE_PROFILE, std::memory_order_release);
+        }
     } else if (g_frb_dispatcher != nullptr) {
         __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                "FRB model ABI disabled: profile=%s libapp Build ID=%s",
-                launcherAbiProfileName(profile), dartBuildId);
+                "FRB model ABI disabled: profile=%s libapp Build ID=%s fingerprint=%d",
+                launcherAbiProfileName(profile), dartBuildId,
+                g_launcher_fingerprint_ready.load(std::memory_order_acquire) ? 1 : 0);
     }
     __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-            "Native LauncherApps APIs profile=%s shortcuts=%d appInfo=%d sqlite=%d frb_model=%d",
+            "Native LauncherApps APIs profile=%s shortcuts=%d appInfo=%d sqlite=%d frb_model=%d move=%d",
             launcherAbiProfileName(profile),
             shortcuts ? 1 : 0,
             (g_capabilities.load() & CAP_APP_INFO_API) != 0 ? 1 : 0,
             g_sqlite_open_v2 != nullptr ? 1 : 0,
-            (g_capabilities.load() & CAP_FRB_MODEL) != 0 ? 1 : 0);
+            (g_capabilities.load() & CAP_FRB_MODEL) != 0 ? 1 : 0,
+            (g_capabilities.load() & CAP_MOVE_PROFILE) != 0 ? 1 : 0);
 }
 
 void resolvePrivate(const char *name, void *handle) {
     char aidlId[33] = {};
     char uiId[33] = {};
     char buildId[sizeof(g_private_build_id)] = {};
-    if (!readBuildId(name, buildId, sizeof(buildId))) {
+    const bool privateBuildIdReady = readBuildId(name, buildId, sizeof(buildId));
+    if (!privateBuildIdReady) {
         __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                "Rust accessibility library has no readable Build ID: %s", name);
-        return;
+                "Rust accessibility library has no readable Build ID: %s; using ELF fingerprint",
+                name);
     }
     LauncherAbiProfile profile = g_launcher_profile.load(std::memory_order_acquire);
     if (profile == LauncherAbiProfile::kUnknown) {
         char dartBuildId[33] = {};
         profile = refreshLauncherAbiProfile(dartBuildId, sizeof(dartBuildId));
     }
-    bool systemIdsReady = readBuildId("libhyper_os_aidl.dylib.so", aidlId, sizeof(aidlId))
-            && readBuildId("libhyper_os_ui_public.so", uiId, sizeof(uiId));
+    ElfFingerprint privateFingerprint{};
+    ElfFingerprint aidlFingerprint{};
+    ElfFingerprint uiFingerprint{};
+    const bool systemFingerprintReady = readModuleFingerprint(name, privateFingerprint)
+            && readModuleFingerprint("libhyper_os_aidl.dylib.so", aidlFingerprint)
+            && readModuleFingerprint("libhyper_os_ui_public.so", uiFingerprint);
+    readBuildId("libhyper_os_aidl.dylib.so", aidlId, sizeof(aidlId));
+    readBuildId("libhyper_os_ui_public.so", uiId, sizeof(uiId));
     std::lock_guard lock(g_mutex);
     std::memcpy(g_private_build_id, buildId, sizeof(g_private_build_id));
-    if (!systemIdsReady || !profileMatchesSystemAbi(profile, buildId, aidlId, uiId)) {
+    if (!systemFingerprintReady || !profileMatchesSystemAbi(profile, buildId, aidlId, uiId,
+            privateFingerprint, aidlFingerprint, uiFingerprint)) {
         g_capabilities.fetch_and(~(CAP_PRIVATE_BUILD_MATCH | CAP_PRIVATE_SYMBOLS
-                | CAP_SELECTION_STATE | CAP_FRB_MODEL),
+                | CAP_SELECTION_STATE | CAP_FRB_MODEL | CAP_MOVE_PROFILE),
                 std::memory_order_release);
         __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                "Rust accessibility ABI mismatch: profile=%s private=%s aidl=%s ui=%s",
-                launcherAbiProfileName(profile), buildId, aidlId, uiId);
+                "Rust accessibility ABI mismatch: profile=%s private=%s aidl=%s ui=%s fingerprint=%d",
+                launcherAbiProfileName(profile), buildId, aidlId, uiId,
+                systemFingerprintReady ? 1 : 0);
         return;
     }
     g_capabilities.fetch_or(CAP_PRIVATE_BUILD_MATCH, std::memory_order_release);
@@ -4121,7 +4556,7 @@ void resolvePrivate(const char *name, void *handle) {
             && interactionPerformAction != nullptr && connectionPerformAction != nullptr) {
         g_capabilities.fetch_or(CAP_PRIVATE_SYMBOLS, std::memory_order_release);
         __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-                "Rust ABI symbols resolved for current Build ID");
+            "Rust ABI symbols resolved for verified ELF fingerprint");
         if (g_original_create_node == nullptr) {
             g_create_node = reinterpret_cast<CreateNodeFn>(createNode);
             if (!g_create_hook_attempted.exchange(true, std::memory_order_acq_rel)
@@ -4176,10 +4611,12 @@ void resolvePublic(void *handle) {
         return;
     }
     char buildId[sizeof(kExpectedPublicBuildId)] = {};
-    if (!readBuildId("libhyper_os_accessibility_public.so", buildId, sizeof(buildId))
-            || std::strcmp(buildId, kExpectedPublicBuildId) != 0) {
+    readBuildId("libhyper_os_accessibility_public.so", buildId, sizeof(buildId));
+    ElfFingerprint fingerprint{};
+    if (!readModuleFingerprint("libhyper_os_accessibility_public.so", fingerprint)
+            || !fingerprintMatches(fingerprint, kPublicFingerprint)) {
         __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                "Rust public accessibility Build ID mismatch: %s", buildId);
+                "Rust public accessibility ELF fingerprint mismatch: build=%s", buildId);
         g_capabilities.fetch_and(~(CAP_PUBLIC_BUILD_MATCH | CAP_PUBLIC_NODE_API
                 | CAP_NODE_HOOK_INSTALLED | CAP_PAGE_SCROLL_EVENT), std::memory_order_release);
         return;
@@ -4339,6 +4776,7 @@ void injectIconActions(void *node) {
                     nodeField<int64_t>(node, 0x338) >> 32U);
             bool lifted = g_lifted.load(std::memory_order_acquire);
             bool liftedSource = isLiftedSource(sourceId);
+            bool moveReady = moveActionsReady();
             if (!lifted || !liftedSource) {
                 injectDirectAction(node, kLiftAction,
                         nodeSelected(node) ? kMultiLiftLabel : kLiftLabel);
@@ -4346,7 +4784,7 @@ void injectIconActions(void *node) {
             if (lifted) {
                 injectDirectAction(node, kCancelAction, kCancelLabel);
             }
-            if (lifted && !liftedSource) {
+            if (lifted && !liftedSource && moveReady) {
                 std::string label = nodeString(node, 0x138);
                 std::u16string spoken = u"移到 ";
                 spoken += utf16FromUtf8(label);
@@ -4360,10 +4798,7 @@ void injectIconActions(void *node) {
                 AppTarget target = targetForNode(sourceId, node);
                 if (!target.package.empty() && !target.activity.empty()) {
                     injectDirectAction(node, kAppInfoAction, kAppInfoLabel);
-                    if (target.user == 0 && g_scene_start_activity != nullptr
-                            && g_intent_default != nullptr && g_intent_set_action != nullptr
-                            && g_intent_set_component != nullptr
-                            && g_intent_set_extras != nullptr) {
+                    if (target.user == 0 && uninstallLaunchReady()) {
                         injectDirectAction(node, kUninstallAction, kUninstallLabel);
                     }
                     for (size_t index = 0; index < target.shortcuts.size()

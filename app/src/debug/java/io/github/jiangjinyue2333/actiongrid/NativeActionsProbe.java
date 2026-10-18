@@ -60,9 +60,6 @@ public final class NativeActionsProbe extends Instrumentation {
                 return;
             }
             visitRoot(ui);
-            if (icons == 0 || directActions == 0) {
-                throw new AssertionError("No direct Home icon actions");
-            }
             if (nativeMenuVisible) {
                 throw new AssertionError("Native long-press menu action is still exposed");
             }
@@ -72,6 +69,13 @@ public final class NativeActionsProbe extends Instrumentation {
                     visitRoot(ui);
                 }
                 if (!executed) throw new AssertionError("Requested action did not return success");
+            }
+            // A successful action may replace Home immediately (for example,
+            // the package installer confirmation page). In that case the
+            // first tree read can contain no Home icons even though the
+            // requested action already ran.
+            if (!executed && (icons == 0 || directActions == 0)) {
+                throw new AssertionError("No direct Home icon actions");
             }
             SystemClock.sleep(250);
             if (arguments.containsKey("action")) {
