@@ -127,7 +127,7 @@ final class PageIndicatorOrder implements SharedPreferences.OnSharedPreferenceCh
         }
     }
 
-    private static boolean isIndicator(String value) {
+    static boolean isIndicator(String value) {
         return INDICATOR_PATTERN.matcher(value).find();
     }
 
