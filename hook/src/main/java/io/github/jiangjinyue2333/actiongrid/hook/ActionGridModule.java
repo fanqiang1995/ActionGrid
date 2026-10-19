@@ -104,6 +104,10 @@ public final class ActionGridModule extends XposedModule {
             boolean hasCode = application != null
                     && (application.flags & ApplicationInfo.FLAG_HAS_CODE) != 0;
             long version = applicationVersion(application);
+            // 页码指示器翻页方向独立于两条整理路径，先装，避免后续 profile 不匹配时一起失效
+            boolean pageOrder = PageOrderHook.install(this);
+            log(pageOrder ? Log.INFO : Log.WARN, TAG,
+                    "Page order hooks " + (pageOrder ? "installed" : "unavailable"));
             boolean nativeCandidate = HyperOs4Compatibility.isNativeCandidate(
                     Build.VERSION.SDK_INT, version, hasCode);
             if (nativeCandidate) {
