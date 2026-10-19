@@ -26,6 +26,9 @@ final class PhoneMenuBridge {
 
     private static XposedModule host;
     private static volatile String pendingLabel;
+    private static volatile String[] pendingLabels;
+    private static volatile boolean discovering;
+    private static volatile MenuListener discoveryListener;
     private static volatile long pendingAt;
     private static volatile boolean installed;
 
@@ -46,6 +49,18 @@ final class PhoneMenuBridge {
                     .setId("actiongrid.phone.window.addview.v1")
                     .intercept(chain -> {
                         Object added = chain.getArg(0);
+                        if (discovering && added instanceof View discovered) {
+                            String[] labels = menuLabels(discovered);
+                            MenuListener listener = discoveryListener;
+                            discovering = false;
+                            discoveryListener = null;
+                            if (listener != null) {
+                                listener.onMenuLabels(labels);
+                            }
+                            log("menu discovered items="
+                                    + (labels == null ? -1 : labels.length));
+                            return null;
+                        }
                         String label = pendingLabel;
                         if (label == null || SystemClock.elapsedRealtime() - pendingAt
                                 > PENDING_MENU_MILLIS || !(added instanceof View view)) {
@@ -55,7 +70,7 @@ final class PhoneMenuBridge {
                         pendingLabel = null;
                         boolean handled = false;
                         try {
-                            handled = captureAndInvoke(view, label);
+                            handled = captureAndInvoke(view, pendingLabels);
                         } catch (Throwable throwable) {
                             log("menu capture failed " + throwable.getClass().getSimpleName());
                         }
@@ -101,7 +116,7 @@ final class PhoneMenuBridge {
                             boolean handled = false;
                             try {
                                 handled = captureAndInvoke(
-                                        (PopupWindow) chain.getThisObject(), label);
+                                        (PopupWindow) chain.getThisObject(), pendingLabels);
                             } catch (Throwable throwable) {
                                 log("popup capture failed "
                                         + throwable.getClass().getSimpleName());
@@ -114,17 +129,54 @@ final class PhoneMenuBridge {
         }
     }
 
+    interface MenuListener {
+        void onMenuLabels(String[] labels);
+    }
+
+    /** 静默长按一次，只为读出官方菜单项；菜单不会显示。 */
+    static boolean discoverMenu(View row, MenuListener listener) {
+        discoveryListener = listener;
+        discovering = true;
+        pendingLabel = null;
+        boolean clicked = row.performLongClick();
+        if (discovering) {
+            discovering = false;
+            discoveryListener = null;
+        }
+        return clicked;
+    }
+
+    private static String[] menuLabels(View window) {
+        ListView list = findListView(window);
+        if (list == null) {
+            return null;
+        }
+        Adapter adapter = list.getAdapter();
+        if (adapter == null) {
+            return null;
+        }
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        for (int position = 0; position < adapter.getCount(); position++) {
+            String title = title(adapter.getItem(position));
+            if (title != null && !title.trim().isEmpty()) {
+                labels.add(title);
+            }
+        }
+        return labels.toArray(new String[0]);
+    }
+
     /** 触发这一行的官方长按菜单，并把 label 对应的那一项直接执行掉。 */
-    static boolean runMenuAction(View row, String label) {
-        pendingLabel = label;
+    static boolean runMenuAction(View row, String... labels) {
+        pendingLabel = labels == null || labels.length == 0 ? "" : labels[0];
+        pendingLabels = labels;
         pendingAt = SystemClock.elapsedRealtime();
         boolean clicked = row.performLongClick();
         boolean handled = pendingLabel == null;
-        log("long press for " + label + " " + clicked + " handled=" + handled);
+        log("long press for " + pendingLabel + " " + clicked + " handled=" + handled);
         return handled;
     }
 
-    private static boolean captureAndInvoke(Object window, String label) {
+    private static boolean captureAndInvoke(Object window, String[] labels) {
         View content = window instanceof PopupWindow popup
                 ? contentView(popup) : (View) window;
         if (content == null) {
@@ -138,12 +190,16 @@ final class PhoneMenuBridge {
         if (adapter == null) {
             return false;
         }
-        String wanted = normalize(label);
         for (int position = 0; position < adapter.getCount(); position++) {
             Object item = adapter.getItem(position);
-            String title = title(item);
-            if (title != null && normalize(title).equals(wanted)) {
-                return activate(list, adapter, position, item);
+            String title = normalize(title(item));
+            if (title.isEmpty()) {
+                continue;
+            }
+            for (String candidate : labels) {
+                if (title.equals(normalize(candidate))) {
+                    return activate(list, adapter, position, item);
+                }
             }
         }
         return false;
