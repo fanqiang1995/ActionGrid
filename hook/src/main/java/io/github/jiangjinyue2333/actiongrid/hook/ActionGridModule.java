@@ -18,9 +18,11 @@ import java.util.Set;
 import io.github.libxposed.api.XposedModule;
 
 public final class ActionGridModule extends XposedModule {
-    private static final String TARGET_PACKAGE = "com.miui.home";
+    private static final String LAUNCHER_PACKAGE = "com.miui.home";
+    private static final String PHONE_PACKAGE = "com.android.contacts";
     private static final String TAG = "ActionGrid";
 
+    private String targetPackage;
     private boolean targetProcess;
     private boolean packageAccepted;
     private final Set<String> loggedFailures = new HashSet<>();
@@ -29,7 +31,10 @@ public final class ActionGridModule extends XposedModule {
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        targetProcess = TARGET_PACKAGE.equals(param.getProcessName()) && !param.isSystemServer();
+        String process = param.getProcessName();
+        targetPackage = LAUNCHER_PACKAGE.equals(process) ? LAUNCHER_PACKAGE
+                : PHONE_PACKAGE.equals(process) ? PHONE_PACKAGE : null;
+        targetProcess = targetPackage != null && !param.isSystemServer();
         Log.i(TAG, "onModuleLoaded process=" + param.getProcessName()
                 + " target=" + targetProcess);
         if (targetProcess) {
@@ -58,7 +63,8 @@ public final class ActionGridModule extends XposedModule {
     public void onPackageLoaded(PackageLoadedParam param) {
         Log.i(TAG, "onPackageLoaded package=" + param.getPackageName()
                 + " targetProcess=" + targetProcess);
-        if (targetProcess && TARGET_PACKAGE.equals(param.getPackageName())) {
+        if (targetProcess && targetPackage != null
+                && targetPackage.equals(param.getPackageName())) {
             packageAccepted = true;
         }
     }
@@ -67,7 +73,14 @@ public final class ActionGridModule extends XposedModule {
     public void onPackageReady(PackageReadyParam param) {
         Log.i(TAG, "onPackageReady package=" + param.getPackageName()
                 + " accepted=" + packageAccepted);
-        if (!packageAccepted || !TARGET_PACKAGE.equals(param.getPackageName())) {
+        if (!packageAccepted || targetPackage == null
+                || !targetPackage.equals(param.getPackageName())) {
+            return;
+        }
+        if (PHONE_PACKAGE.equals(targetPackage)) {
+            boolean installed = PhoneCallLogAdapter.install(this, param.getClassLoader());
+            log(installed ? Log.INFO : Log.ERROR, TAG,
+                    "Phone call log adapter " + (installed ? "installed" : "unavailable"));
             return;
         }
         try {
