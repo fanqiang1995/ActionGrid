@@ -5,8 +5,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 
@@ -89,6 +92,67 @@ final class PhoneCallLogAdapter {
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Set<String> DISCOVERING =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static final java.util.Map<String, Integer> DISCOVERY_FAILS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 诊断开关：平时关闭（省电、防 log 刷屏）；排查问题改 true 重编。 */
+    private static final boolean DEBUG = false;
+
+    /** 消息类型指纹：行的子 View 类名组合。
+     *  自研容器拿不到数据位置（getPositionForView 恒 -1），但每种消息类型的
+     *  子 View 结构天然不同（文字/图片/语音气泡类名不一样），足够区分菜单。 */
+    private static String typeFingerprint(View item) {
+        if (!(item instanceof ViewGroup group)) {
+            return "?";
+        }
+        StringBuilder fingerprint = new StringBuilder();
+        for (int index = 0; index < group.getChildCount(); index++) {
+            View child = group.getChildAt(index);
+            if (child != null) {
+                fingerprint.append(child.getClass().getSimpleName()).append('.');
+            }
+        }
+        return fingerprint.toString();
+    }
+
+    /** 聊天消息的菜单缓存键：行类名 + 类型指纹。 */
+    private static String chatMenuKey(View row) {
+        return "wxmsg:" + row.getClass().getSimpleName() + ":" + typeFingerprint(row);
+    }
+
+    /** 气泡子 View 往上找所属的消息 item：
+     *  ① 类名含 viewitems.ChattingItem；或
+     *  ② 父 View 是 ScrollControlRecyclerView（聊天列表，结构判定不依赖混淆名）。 */
+    private static View findChatItemAncestor(View view) {
+        StringBuilder chain = new StringBuilder();
+        View current = view;
+        for (int i = 0; i < 10 && current != null; i++) {
+            String name = current.getClass().getName();
+            if (name.endsWith("viewitems.ChattingItem")) {
+                return current;
+            }
+            ViewParent parent = current.getParent();
+            if (parent != null
+                    && parent.getClass().getName().endsWith("ScrollControlRecyclerView")) {
+                return current;
+            }
+            chain.append(current.getClass().getSimpleName()).append(" <- ");
+            current = parent instanceof View v ? v : null;
+        }
+        if (DEBUG) {
+            // 真身未知时把走过的父链记下来（每条不同链只记一次）。
+            String chainStr = chain.toString();
+            if (ANCESTOR_CHAINS_LOGGED.add(chainStr)) {
+                log("chat ancestor chain: " + chainStr + "end");
+            }
+        }
+        return null;
+    }
+
+    private static final java.util.Set<String> ANCESTOR_CHAINS_LOGGED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private static final int MENU_DYNAMIC_OFFSET = 100;
     private static final int MENU_DYNAMIC_LIMIT = 32;
 
@@ -123,9 +187,13 @@ final class PhoneCallLogAdapter {
             new Entry(2, "不显示该聊天", Kind.MENU, null),
             new Entry(3, "删除该聊天", Kind.MENU, null));
 
+    private static final Spec WECHAT_CHAT = new Spec(
+            "com.tencent.mm", null, null, "viewitems.ChattingItem",
+            0x6B000700, false);
+
     private static final Spec[] SPECS = {
             CALL_LOG, CONTACT, NUMBER_ACTIONS, DETAIL_NUMBER,
-            SMS_CONVERSATION, SMS_VERIFY_CODE, SMS_MESSAGE, WECHAT_CONVERSATION};
+            SMS_CONVERSATION, SMS_VERIFY_CODE, SMS_MESSAGE, WECHAT_CONVERSATION, WECHAT_CHAT};
 
     private static final String WECHAT_PACKAGE = "com.tencent.mm";
 
@@ -222,6 +290,7 @@ final class PhoneCallLogAdapter {
             View rowView = null;
             String viewClassName = null;
             boolean resolved = false;
+            View focusView = null;
             for (Spec spec : SPECS) {
                 if (!spec.packageName.equals(packageName)) {
                     continue;
@@ -237,45 +306,72 @@ final class PhoneCallLogAdapter {
                         resolved = true;
                         rowView = resolveRowView(node, controller);
                         viewClassName = rowView == null ? null : rowView.getClass().getName();
-                        if (WECHAT_PACKAGE.equals(packageName) && rowView != null
-                                && ROW_CLASSES.add(viewClassName)) {
-                            // 诊断：微信里每个被解析出来的行 View 类名记一次，
-                            // 用于发现折叠行这类不在 ConversationFolderItemView 规则里的特殊行。
-                            log("wx row class " + viewClassName);
+                        if (DEBUG && WECHAT_PACKAGE.equals(packageName)
+                                && rowView != null) {
+                            if (ROW_CLASSES.add(viewClassName)) {
+                                log("wx row class " + viewClassName);
+                            }
+                            // 会话行、各类消息行各 dump 一份结构（按类去重）。
+                            WeChatDumper.dumpOnce(rowView);
                         }
+                        focusView = rowView;
                     }
                     if (viewClassName == null
                             || !viewClassName.endsWith(spec.viewClassSuffix)) {
-                        continue;
+                        if (spec == WECHAT_CHAT && rowView != null) {
+                            // 天坦常聚焦气泡子 View，往上找所属的消息 item，
+                            // 动作挂在聚焦的节点上。
+                            View item = findChatItemAncestor(rowView);
+                            if (item == null) {
+                                continue;
+                            }
+                            if (DEBUG) {
+                                log("chat ancestor hit "
+                                        + item.getClass().getSimpleName());
+                            }
+                            rowView = item;
+                        } else {
+                            continue;
+                        }
                     }
                 }
-                decorateRow(node, spec, rowView, controller);
+                decorateRow(node, spec, rowView, focusView, controller);
                 return;
             }
-        } catch (Throwable ignored) {
-            // 节点读取失败不影响原行为
+        } catch (Throwable throwable) {
+            // 节点读取失败不影响原行为，但要留痕：聊天页曾在这里默默折断。
+            log("decorate failed " + throwable);
         }
     }
 
     private static void decorateRow(AccessibilityNodeInfo node, Spec spec,
-                                    View rowView, Object controller) {
-        if (WECHAT_PACKAGE.equals(spec.packageName)) {
+                                    View rowView, View focusView, Object controller) {
+        if (DEBUG && WECHAT_PACKAGE.equals(spec.packageName)) {
             // 一次性诊断：拿真实结构，不再盲猜字段名。
             WeChatDumper.dumpOnce(rowView);
         }
         String key = spec.key();
+        if (WECHAT_CHAT == spec && rowView != null) {
+            // 聊天消息：同一 spec 覆盖多种消息行（文本/图片/语音…），
+            // 菜单按行类名+消息类型分开发现、分开缓存，避免拿文本的菜单塞给图片。
+            key = chatMenuKey(rowView);
+            if (DISCOVERED_MENUS.get(key) == null) {
+                // autoDiscover 关着（防 B 段重复注入），发现在这里手动触发。
+                scheduleDiscovery(key, spec, node, controller, rowView, focusView);
+            }
+        }
         String[] menu = DISCOVERED_MENUS.get(key);
         if (menu == null) {
             menu = spec.presetMenuLabels();
             if (spec.autoDiscover) {
-                scheduleDiscovery(key, spec, node, controller, rowView);
+                scheduleDiscovery(key, spec, node, controller, rowView, focusView);
             }
         }
         // 公众号/服务号等聚合行：官方菜单只有不显示/删除，置顶和已读不适用，直接不注入。
         boolean officialRow = WECHAT_PACKAGE.equals(spec.packageName)
                 && WeChatProbe.isOfficialAccount(rowView);
-        if (WECHAT_PACKAGE.equals(spec.packageName)) {
-            // 诊断：记录每个出现过的 username，用于确认特殊行（折叠的聊天等）的真实用户名。
+        if (DEBUG && WECHAT_PACKAGE.equals(spec.packageName)) {
+            // 诊断：记录每个出现过的 username（特殊行排查用）。
             WeChatProbe.logUsernameOnce(rowView);
         }
         for (Entry entry : spec.entries) {
@@ -292,12 +388,18 @@ final class PhoneCallLogAdapter {
         for (int index = 0; index < menu.length && index < MENU_DYNAMIC_LIMIT; index++) {
             addAction(node, spec.base + MENU_DYNAMIC_OFFSET + index, menu[index]);
         }
-        dumpActionsOnce(spec, node);
+        if (DEBUG) {
+            dumpActionsOnce(spec, rowView, node);
+        }
     }
 
     /** 第一次遇到这类行：后台静默长按一次，把官方菜单项全量读下来。 */
     private static void scheduleDiscovery(String key, Spec spec, AccessibilityNodeInfo node,
-                                          Object controller, View rowView) {
+                                          Object controller, View rowView, View focusView) {
+        Integer fails = DISCOVERY_FAILS.get(key);
+        if (fails != null && fails >= 6) {
+            return;
+        }
         if (!DISCOVERING.add(key)) {
             return;
         }
@@ -307,11 +409,15 @@ final class PhoneCallLogAdapter {
                 DISCOVERING.remove(key);
                 return;
             }
-            PhoneMenuBridge.discoverMenu(target, labels -> {
+            PhoneMenuBridge.discoverMenu(target, focusView, labels -> {
                 try {
                     if (labels != null && labels.length > 0) {
                         DISCOVERED_MENUS.put(key, labels);
                         log("discovered " + key + " -> " + String.join("/", labels));
+                    } else {
+                        DISCOVERY_FAILS.merge(key, 1, Integer::sum);
+                        log("discovered " + key + " empty (fail "
+                                + DISCOVERY_FAILS.get(key) + ")");
                     }
                 } finally {
                     DISCOVERING.remove(key);
@@ -342,13 +448,16 @@ final class PhoneCallLogAdapter {
         }
     }
 
-    private static final java.util.concurrent.atomic.AtomicBoolean ACTIONS_DUMPED =
-            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.Set<String> ACTIONS_DUMPED =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    /** 一次性打印该行最终注入的全部 action，验证到底塞了几条、有没有重复。 */
-    private static void dumpActionsOnce(Spec spec, AccessibilityNodeInfo node) {
-        if (!WECHAT_PACKAGE.equals(spec.packageName)
-                || !ACTIONS_DUMPED.compareAndSet(false, true)) {
+    /** 每类行只打印一次最终注入的全部 action，验证到底塞了几条、有没有重复。 */
+    private static void dumpActionsOnce(Spec spec, View rowView, AccessibilityNodeInfo node) {
+        String key = spec.key();
+        if (WECHAT_CHAT == spec && rowView != null) {
+            key = chatMenuKey(rowView);
+        }
+        if (!WECHAT_PACKAGE.equals(spec.packageName) || !ACTIONS_DUMPED.add(key)) {
             return;
         }
         try {
@@ -400,8 +509,20 @@ final class PhoneCallLogAdapter {
             String dynamicLabel = match.dynamicLabel;
             boolean handled = false;
             try {
-                if (dynamicLabel != null) {
-                    handled = PhoneMenuBridge.runMenuAction(row, dynamicLabel);
+                if (match.menuIndex >= 0) {
+                    // 聊天消息：按行类名+消息类型拿到对应菜单，再取本槽位的文案。
+                    View item = findChatItemAncestor(row);
+                    View target = item != null ? item : row;
+                    String[] menu = DISCOVERED_MENUS.get(chatMenuKey(target));
+                    String label = menu != null && match.menuIndex < menu.length
+                            ? menu[match.menuIndex] : null;
+                    if (label != null) {
+                        // origin=聚焦的原节点，长按从它往上找监听器，别按到头像。
+                        handled = PhoneMenuBridge.runMenuAction(target, row, label);
+                        WeChatProbe.invalidate(target);
+                    }
+                } else if (dynamicLabel != null) {
+                    handled = PhoneMenuBridge.runMenuAction(row, null, dynamicLabel);
                 } else if (entry != null) {
                     switch (entry.kind) {
                         case ROW_CLICK -> handled = row.performClick();
@@ -416,7 +537,7 @@ final class PhoneCallLogAdapter {
                                     labels = resolved;
                                 }
                             }
-                            handled = PhoneMenuBridge.runMenuAction(row, labels);
+                            handled = PhoneMenuBridge.runMenuAction(row, null, labels);
                             // 菜单执行后置顶/未读状态已变，立刻丢缓存，
                             // 否则下次焦点进来文案还停在旧状态。
                             WeChatProbe.invalidate(row);
@@ -446,6 +567,10 @@ final class PhoneCallLogAdapter {
             }
             int index = action - (spec.base + MENU_DYNAMIC_OFFSET);
             if (index >= 0 && index < MENU_DYNAMIC_LIMIT) {
+                if (spec == WECHAT_CHAT) {
+                    // 聊天消息：具体文案要等拿到行才能按类名解析，这里只记槽位。
+                    return new Match(spec, null, null, index);
+                }
                 String[] menu = DISCOVERED_MENUS.get(spec.key());
                 String label = null;
                 if (menu != null && index < menu.length) {
@@ -625,11 +750,17 @@ final class PhoneCallLogAdapter {
         final Spec spec;
         final Entry entry;
         final String dynamicLabel;
+        final int menuIndex;
 
         Match(Spec spec, Entry entry, String dynamicLabel) {
+            this(spec, entry, dynamicLabel, -1);
+        }
+
+        Match(Spec spec, Entry entry, String dynamicLabel, int menuIndex) {
             this.spec = spec;
             this.entry = entry;
             this.dynamicLabel = dynamicLabel;
+            this.menuIndex = menuIndex;
         }
     }
 }

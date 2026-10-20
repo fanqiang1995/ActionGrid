@@ -30,35 +30,36 @@ final class WeChatDumper {
     private static final int MAX_FIELDS = 120;
     private static final int MAX_LIST_ROWS = 30;
     private static final int MAX_VALUE_CHARS = 96;
-    private static final AtomicBoolean DONE = new AtomicBoolean();
-    private static final java.util.concurrent.atomic.AtomicInteger RETRIES =
-            new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.Set<String> DUMPED_CLASSES =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private WeChatDumper() {
     }
 
+    /** 每个行类只 dump 一次：会话行、各类消息行各拿一份结构。 */
     static void dumpOnce(View row) {
-        if (row == null || !DONE.compareAndSet(false, true)) {
+        if (row == null) {
             return;
         }
-        // 首次触发时列表可能尚未绑定数据，延迟取表；取不到就重置重试。
+        String cls = row.getClass().getName();
+        if (!DUMPED_CLASSES.add(cls)) {
+            return;
+        }
+        // 首次触发时数据可能尚未绑定，延迟取表。
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
-                () -> runDump(row), 700L);
+                () -> runDump(row, cls), 700L);
     }
 
-    private static void runDump(View row) {
-        int rows = -1;
+    private static void runDump(View row, String cls) {
         try {
+            Log.i(TAG, "===== dump " + cls + " =====");
             dumpView(row);
             dumpHolders(row);
-            rows = dumpAdapter(row);
-            Log.i(TAG, "===== dump complete rows=" + rows + " =====");
+            dumpAdapter(row);
+            Log.i(TAG, "===== dump complete =====");
         } catch (Throwable throwable) {
             Log.e(TAG, "dump failed: " + throwable, throwable);
-        }
-        if (rows == 0 && RETRIES.incrementAndGet() <= 8) {
-            Log.i(TAG, "no rows yet, retry " + RETRIES.get());
-            DONE.set(false);
+            DUMPED_CLASSES.remove(cls);
         }
     }
 
@@ -359,10 +360,5 @@ final class WeChatDumper {
         } catch (Throwable ignored) {
             return "?";
         }
-    }
-
-    /** 允许重新 dump（换一批数据后再抓一次）。 */
-    static void reset() {
-        DONE.set(false);
     }
 }
