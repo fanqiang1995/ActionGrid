@@ -21,6 +21,7 @@ public final class ActionGridModule extends XposedModule {
     private static final String LAUNCHER_PACKAGE = "com.miui.home";
     private static final String PHONE_PACKAGE = "com.android.contacts";
     private static final String SMS_PACKAGE = "com.android.mms";
+    private static final String WECHAT_PACKAGE = "com.tencent.mm";
     private static final String TAG = "ActionGrid";
 
     private String targetPackage;
@@ -35,7 +36,8 @@ public final class ActionGridModule extends XposedModule {
         String process = param.getProcessName();
         targetPackage = LAUNCHER_PACKAGE.equals(process) ? LAUNCHER_PACKAGE
                 : PHONE_PACKAGE.equals(process) ? PHONE_PACKAGE
-                : SMS_PACKAGE.equals(process) ? SMS_PACKAGE : null;
+                : SMS_PACKAGE.equals(process) ? SMS_PACKAGE
+                : WECHAT_PACKAGE.equals(process) ? WECHAT_PACKAGE : null;
         targetProcess = targetPackage != null && !param.isSystemServer();
         Log.i(TAG, "onModuleLoaded process=" + param.getProcessName()
                 + " target=" + targetProcess);
@@ -77,6 +79,12 @@ public final class ActionGridModule extends XposedModule {
                 + " accepted=" + packageAccepted);
         if (!packageAccepted || targetPackage == null
                 || !targetPackage.equals(param.getPackageName())) {
+            return;
+        }
+        if (WECHAT_PACKAGE.equals(targetPackage)) {
+            boolean installed = PhoneCallLogAdapter.install(this, param.getClassLoader());
+            log(installed ? Log.INFO : Log.ERROR, TAG,
+                    "WeChat adapter " + (installed ? "installed" : "unavailable"));
             return;
         }
         if (SMS_PACKAGE.equals(targetPackage)) {

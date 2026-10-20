@@ -101,9 +101,32 @@ final class PhoneCallLogAdapter {
             new Entry(3, "删除", Kind.MENU, null),
             new Entry(4, "多选", Kind.MENU, null));
 
+    /** 微信会话行：默认操作改为「激活」，菜单项自动 dismiss 弹窗。 */
+    private static final Spec WECHAT_CONVERSATION = new Spec("com.tencent.mm",
+            null, null, "ConversationFolderItemView", 0x6B000601, false,
+            // 标为已读/未读：根据当前已读状态动态显示文案。
+            new Entry(0, Kind.MENU, null, view -> {
+                        boolean[] state = WeChatProbe.probe(view);
+                        if (state == null) {
+                            return new String[]{"标为已读", "标为未读"};
+                        }
+                        return state[1] ? new String[]{"标为已读"} : new String[]{"标为未读"};
+                    }, "标为已读", "标为未读"),
+            // 置顶/取消置顶：根据当前置顶状态动态显示文案。
+            new Entry(1, Kind.MENU, null, view -> {
+                        boolean[] state = WeChatProbe.probe(view);
+                        if (state == null) {
+                            return new String[]{"置顶该聊天", "取消置顶", "置顶", "取消置顶该聊天"};
+                        }
+                        return state[0] ? new String[]{"取消置顶"} : new String[]{"置顶该聊天"};
+                    }, "置顶该聊天", "取消置顶", "置顶", "取消置顶该聊天"),
+            new Entry(2, "激活", Kind.ROW_CLICK, null),
+            new Entry(3, "不显示该聊天", Kind.MENU, null),
+            new Entry(4, "删除该聊天", Kind.MENU, null));
+
     private static final Spec[] SPECS = {
             CALL_LOG, CONTACT, NUMBER_ACTIONS, DETAIL_NUMBER,
-            SMS_CONVERSATION, SMS_VERIFY_CODE, SMS_MESSAGE};
+            SMS_CONVERSATION, SMS_VERIFY_CODE, SMS_MESSAGE, WECHAT_CONVERSATION};
 
     private static XposedModule host;
     private static Method nodeIsSealed;
@@ -223,11 +246,16 @@ final class PhoneCallLogAdapter {
         String[] menu = DISCOVERED_MENUS.get(key);
         if (menu == null) {
             menu = spec.presetMenuLabels();
-            scheduleDiscovery(key, spec, node, controller, rowView);
+            if (spec.autoDiscover) {
+                scheduleDiscovery(key, spec, node, controller, rowView);
+            }
         }
         for (Entry entry : spec.entries) {
             if (entry.kind != Kind.MENU) {
-                addAction(node, entry.actionId(spec), entry.label);
+                addAction(node, entry.actionId(spec), entry.displayLabel(rowView));
+            } else if (entry.labelResolver != null) {
+                // 动态朗读文案：根据当前行状态显示「置顶/取消置顶」或「标为已读/标为未读」。
+                addAction(node, entry.actionId(spec), entry.displayLabel(rowView));
             }
         }
         for (int index = 0; index < menu.length && index < MENU_DYNAMIC_LIMIT; index++) {
@@ -324,7 +352,17 @@ final class PhoneCallLogAdapter {
                         case ROW_CLICK -> handled = row.performClick();
                         case CHILD_CLICK -> handled = clickChild(row, match.spec.packageName,
                                 entry.childViewId);
-                        case MENU -> handled = PhoneMenuBridge.runMenuAction(row, entry.menuLabels);
+                        case MENU -> {
+                            // 动态朗读项：根据最新行状态选出要调起的菜单项。
+                            String[] labels = entry.menuLabels;
+                            if (entry.labelResolver != null) {
+                                String[] resolved = entry.labelResolver.resolve(row);
+                                if (resolved != null && resolved.length > 0) {
+                                    labels = resolved;
+                                }
+                            }
+                            handled = PhoneMenuBridge.runMenuAction(row, labels);
+                        }
                         default -> { }
                     }
                 }
@@ -341,7 +379,10 @@ final class PhoneCallLogAdapter {
     private static Match resolve(int action) {
         for (Spec spec : SPECS) {
             for (Entry entry : spec.entries) {
-                if (entry.kind != Kind.MENU && entry.actionId(spec) == action) {
+                int entryAction = entry.actionId(spec);
+                if (entryAction == action) {
+                    // ROW_CLICK/CHILD_CLICK 走 entry；动态 MENU 走 entry（调起时再解）；
+                    // 固定 MENU 走 entry.menuLabels。
                     return new Match(spec, entry, null);
                 }
             }
@@ -415,24 +456,54 @@ final class PhoneCallLogAdapter {
         ROW_CLICK, CHILD_CLICK, MENU
     }
 
+    /** 根据当前行状态返回要调起的菜单项。返回 null 表示使用默认 menuLabels。 */
+    interface LabelResolver {
+        String[] resolve(View row);
+    }
+
     private static final class Entry {
         final int offset;
         final String label;
         final Kind kind;
         final String childViewId;
         final String[] menuLabels;
+        final LabelResolver labelResolver;
 
         Entry(int offset, String label, Kind kind, String childViewId, String... menuAliases) {
+            this(offset, label, kind, childViewId, null, menuAliases);
+        }
+
+        Entry(int offset, Kind kind, String childViewId, LabelResolver labelResolver,
+              String... menuAliases) {
+            this(offset, null, kind, childViewId, labelResolver, menuAliases);
+        }
+
+        private Entry(int offset, String label, Kind kind, String childViewId,
+                      LabelResolver labelResolver, String[] menuAliases) {
             this.offset = offset;
             this.label = label;
             this.kind = kind;
             this.childViewId = childViewId;
+            this.labelResolver = labelResolver;
             this.menuLabels = menuAliases == null || menuAliases.length == 0
                     ? new String[]{label} : menuAliases;
         }
 
         int actionId(Spec spec) {
             return spec.base + offset;
+        }
+
+        String displayLabel(View row) {
+            if (labelResolver != null && row != null) {
+                try {
+                    String[] resolved = labelResolver.resolve(row);
+                    if (resolved != null && resolved.length > 0) {
+                        return resolved[0];
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            return label;
         }
     }
 
@@ -443,6 +514,7 @@ final class PhoneCallLogAdapter {
         final String viewClassSuffix;
         final int base;
         final List<Entry> entries;
+        final boolean autoDiscover;
 
         String key() {
             return packageName + "|" + rowViewId + "|" + classSuffix + "|" + viewClassSuffix;
@@ -452,7 +524,8 @@ final class PhoneCallLogAdapter {
             java.util.List<String> labels = new java.util.ArrayList<>();
             for (Entry entry : entries) {
                 if (entry.kind == Kind.MENU) {
-                    labels.add(entry.label);
+                    // 动态条目没有固定 label，回退到 menuLabels 的第 0 个。
+                    labels.add(entry.label != null ? entry.label : entry.menuLabels[0]);
                 }
             }
             return labels.toArray(new String[0]);
@@ -460,16 +533,27 @@ final class PhoneCallLogAdapter {
 
         Spec(String packageName, String rowViewId, String classSuffix, int base,
              Entry... entries) {
-            this(packageName, rowViewId, classSuffix, null, base, entries);
+            this(packageName, rowViewId, classSuffix, null, base, true, entries);
+        }
+
+        Spec(String packageName, String rowViewId, String classSuffix, int base,
+             boolean autoDiscover, Entry... entries) {
+            this(packageName, rowViewId, classSuffix, null, base, autoDiscover, entries);
         }
 
         Spec(String packageName, String rowViewId, String classSuffix,
              String viewClassSuffix, int base, Entry... entries) {
+            this(packageName, rowViewId, classSuffix, viewClassSuffix, base, true, entries);
+        }
+
+        Spec(String packageName, String rowViewId, String classSuffix,
+             String viewClassSuffix, int base, boolean autoDiscover, Entry... entries) {
             this.packageName = packageName;
             this.rowViewId = rowViewId;
             this.classSuffix = classSuffix;
             this.viewClassSuffix = viewClassSuffix;
             this.base = base;
+            this.autoDiscover = autoDiscover;
             this.entries = List.of(entries);
         }
     }
