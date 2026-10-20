@@ -77,7 +77,10 @@ final class PhoneMenuBridge {
                         log("menu " + label + " " + (handled ? "invoked" : "not found")
                                 + " window=" + view.getClass().getSimpleName());
                         if (!handled) {
-                            return chain.proceed();
+                            // 找不到匹配项时不能放行：放行会把长按菜单弹出来。
+                            // 常见原因是请求了官方菜单里没有的项（如公众号行没有置顶/标为已读）。
+                            // 吞掉并记日志，便于发现文案不匹配的行。
+                            return null;
                         }
                         return null;
                     });

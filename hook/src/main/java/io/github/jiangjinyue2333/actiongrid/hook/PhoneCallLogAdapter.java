@@ -120,13 +120,14 @@ final class PhoneCallLogAdapter {
                         }
                         return state[0] ? new String[]{"取消置顶"} : new String[]{"置顶该聊天"};
                     }, "置顶该聊天", "取消置顶", "置顶", "取消置顶该聊天"),
-            new Entry(2, "激活", Kind.ROW_CLICK, null),
-            new Entry(3, "不显示该聊天", Kind.MENU, null),
-            new Entry(4, "删除该聊天", Kind.MENU, null));
+            new Entry(2, "不显示该聊天", Kind.MENU, null),
+            new Entry(3, "删除该聊天", Kind.MENU, null));
 
     private static final Spec[] SPECS = {
             CALL_LOG, CONTACT, NUMBER_ACTIONS, DETAIL_NUMBER,
             SMS_CONVERSATION, SMS_VERIFY_CODE, SMS_MESSAGE, WECHAT_CONVERSATION};
+
+    private static final String WECHAT_PACKAGE = "com.tencent.mm";
 
     private static XposedModule host;
     private static Method nodeIsSealed;
@@ -203,11 +204,21 @@ final class PhoneCallLogAdapter {
         }
     }
 
+    private static final java.util.Set<String> SEEN_NODE_CLASSES =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static final java.util.Set<String> ROW_CLASSES =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private static void decorate(AccessibilityNodeInfo node, Object controller) {
         try {
             String viewId = node.getViewIdResourceName();
             String className = String.valueOf(node.getClassName());
             String packageName = String.valueOf(node.getPackageName());
+            if (WECHAT_PACKAGE.equals(packageName) && SEEN_NODE_CLASSES.add(className)) {
+                // 诊断：微信里出现的每个节点类名记一次，用来找折叠行这类特殊行的真身。
+                log("wx node class " + className + " viewId=" + viewId);
+            }
             View rowView = null;
             String viewClassName = null;
             boolean resolved = false;
@@ -226,6 +237,12 @@ final class PhoneCallLogAdapter {
                         resolved = true;
                         rowView = resolveRowView(node, controller);
                         viewClassName = rowView == null ? null : rowView.getClass().getName();
+                        if (WECHAT_PACKAGE.equals(packageName) && rowView != null
+                                && ROW_CLASSES.add(viewClassName)) {
+                            // 诊断：微信里每个被解析出来的行 View 类名记一次，
+                            // 用于发现折叠行这类不在 ConversationFolderItemView 规则里的特殊行。
+                            log("wx row class " + viewClassName);
+                        }
                     }
                     if (viewClassName == null
                             || !viewClassName.endsWith(spec.viewClassSuffix)) {
@@ -242,6 +259,10 @@ final class PhoneCallLogAdapter {
 
     private static void decorateRow(AccessibilityNodeInfo node, Spec spec,
                                     View rowView, Object controller) {
+        if (WECHAT_PACKAGE.equals(spec.packageName)) {
+            // 一次性诊断：拿真实结构，不再盲猜字段名。
+            WeChatDumper.dumpOnce(rowView);
+        }
         String key = spec.key();
         String[] menu = DISCOVERED_MENUS.get(key);
         if (menu == null) {
@@ -250,7 +271,17 @@ final class PhoneCallLogAdapter {
                 scheduleDiscovery(key, spec, node, controller, rowView);
             }
         }
+        // 公众号/服务号等聚合行：官方菜单只有不显示/删除，置顶和已读不适用，直接不注入。
+        boolean officialRow = WECHAT_PACKAGE.equals(spec.packageName)
+                && WeChatProbe.isOfficialAccount(rowView);
+        if (WECHAT_PACKAGE.equals(spec.packageName)) {
+            // 诊断：记录每个出现过的 username，用于确认特殊行（折叠的聊天等）的真实用户名。
+            WeChatProbe.logUsernameOnce(rowView);
+        }
         for (Entry entry : spec.entries) {
+            if (officialRow && entry.labelResolver != null) {
+                continue;
+            }
             if (entry.kind != Kind.MENU) {
                 addAction(node, entry.actionId(spec), entry.displayLabel(rowView));
             } else if (entry.labelResolver != null) {
@@ -261,6 +292,7 @@ final class PhoneCallLogAdapter {
         for (int index = 0; index < menu.length && index < MENU_DYNAMIC_LIMIT; index++) {
             addAction(node, spec.base + MENU_DYNAMIC_OFFSET + index, menu[index]);
         }
+        dumpActionsOnce(spec, node);
     }
 
     /** 第一次遇到这类行：后台静默长按一次，把官方菜单项全量读下来。 */
@@ -307,6 +339,29 @@ final class PhoneCallLogAdapter {
             return view;
         } catch (Throwable throwable) {
             return null;
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean ACTIONS_DUMPED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** 一次性打印该行最终注入的全部 action，验证到底塞了几条、有没有重复。 */
+    private static void dumpActionsOnce(Spec spec, AccessibilityNodeInfo node) {
+        if (!WECHAT_PACKAGE.equals(spec.packageName)
+                || !ACTIONS_DUMPED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            List<AccessibilityNodeInfo.AccessibilityAction> list = node.getActionList();
+            StringBuilder builder = new StringBuilder("actions for ")
+                    .append(spec.key()).append(" count=").append(list.size());
+            for (AccessibilityNodeInfo.AccessibilityAction action : list) {
+                builder.append("\n  id=0x").append(Integer.toHexString(action.getId()))
+                        .append(" label=").append(action.getLabel());
+            }
+            log(builder.toString());
+        } catch (Throwable throwable) {
+            log("dumpActions failed " + throwable.getClass().getSimpleName());
         }
     }
 
@@ -362,6 +417,9 @@ final class PhoneCallLogAdapter {
                                 }
                             }
                             handled = PhoneMenuBridge.runMenuAction(row, labels);
+                            // 菜单执行后置顶/未读状态已变，立刻丢缓存，
+                            // 否则下次焦点进来文案还停在旧状态。
+                            WeChatProbe.invalidate(row);
                         }
                         default -> { }
                     }
@@ -524,6 +582,11 @@ final class PhoneCallLogAdapter {
             java.util.List<String> labels = new java.util.ArrayList<>();
             for (Entry entry : entries) {
                 if (entry.kind == Kind.MENU) {
+                    // 带 labelResolver 的条目由 A 段按实时状态注入，这里必须跳过，
+                    // 否则同一个动作会被写死的预设再塞一遍（微信曾因此多出两条重复项）。
+                    if (entry.labelResolver != null) {
+                        continue;
+                    }
                     // 动态条目没有固定 label，回退到 menuLabels 的第 0 个。
                     labels.add(entry.label != null ? entry.label : entry.menuLabels[0]);
                 }
