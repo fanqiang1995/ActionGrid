@@ -16,7 +16,7 @@ import java.util.WeakHashMap;
  * `ConversationFolderItemView` 身上一个状态字段都没有，全程 probe miss。
  * 正解是回到数据源：会话列表 adapter 的 item 才持有状态。
  *
- * 实测（2026-10-20，与强哥屏幕上可见的置顶状态逐行对照）：
+ * 实测（2026-10-20，与屏幕上可见的置顶状态逐行对照）：
  *   未读 = item.field_unReadCount > 0
  *   置顶 = item.field_flag 的 bit62（1L << 62）
  *   ⚠️ field_attrflag 的 0x4000000 不是置顶位，是「是否群聊」（17 条群聊全有、0 条非群聊有），别搞混

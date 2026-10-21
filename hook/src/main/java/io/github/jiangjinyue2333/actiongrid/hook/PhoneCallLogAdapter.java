@@ -98,8 +98,8 @@ final class PhoneCallLogAdapter {
 
     /** 诊断开关：平时关闭（省电、防 log 刷屏）；排查问题改 true 重编。 */
     private static final boolean DEBUG = false;
-    /** 诊断/探针总开关（强哥 2026-10-21：功能稳定后全关，省电）。
-     *  排查问题临时改 true 重新构建即可。 */
+    /** 诊断/探针总开关（功能稳定后默认关闭，省电）。
+     *  排查问题临时改 true 重新构建即可. */
     private static final boolean VERBOSE = false;
 
     /** 消息类型指纹：行的子 View 类名组合。
@@ -367,8 +367,8 @@ final class PhoneCallLogAdapter {
             WeChatDumper.dumpOnce(rowView);
         }
         // 聊天页：直连钩子（今天这套）。
-        // 会话列表：强哥 2026-10-21 拍板回退到昨天那套（预设+静默发现+弹窗拦截），
-        // 昨天那套在会话列表上很稳，今天的直连只留给聊天页。
+        // 会话列表：实测后回退到更稳的「预设+静默发现+弹窗拦截」方案，
+        // 直连钩子只留给聊天页（消息类型多、直连更准）。
         if (WECHAT_PACKAGE.equals(spec.packageName) && spec == WECHAT_CHAT) {
             int injected = 0;
             if (WeChatMenuHook.isAvailable() && rowView != null) {
@@ -634,7 +634,7 @@ final class PhoneCallLogAdapter {
                         }
                     }
                     // 撞上别的菜单构建就先等一等再重试：读屏用户点的就是这一下，
-                    // 直接回 false 就是「有时候不灵」（强哥 2026-10-21 反馈）。
+                    // 直接回 false 就会出现「有时候不灵」。
                     retryWxExecute(anchor, row, match.menuIndex, callback, interactionId, 0);
                     return;
                 } else if (dynamicLabel != null) {

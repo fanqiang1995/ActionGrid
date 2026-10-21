@@ -40,7 +40,7 @@ import io.github.libxposed.api.XposedModule;
  */
 final class WeChatMenuHook {
     private static final String TAG = "ActionGrid-WeChatMenu";
-    /** 诊断日志总开关（强哥 2026-10-21：稳定后全关，省电）。排查时临时改 true。 */
+    /** 诊断日志总开关（稳定后默认关闭，省电）。排查时临时改 true。 */
     private static final boolean VERBOSE = false;
     private static XposedModule host;
     private static boolean installAttempted;
@@ -85,7 +85,7 @@ final class WeChatMenuHook {
             Collections.synchronizedMap(new WeakHashMap<>());
 
     /** 模板兜底：同类行第一次成功建出的菜单。
-     *  某一行自己还没建好时先用模板顶上（强哥 2026-10-21：不能出现「这一行没操作」）。
+     *  某一行自己还没建好时先用模板顶上（用户 2026-10-21：不能出现「这一行没操作」）。
      *  key = spec + 行类名 + 公众号标记。 */
     private static final Map<String, String[]> TEMPLATES =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -202,7 +202,7 @@ final class WeChatMenuHook {
      *
      * <p>用于避开主线程重建菜单：快速滑动时读屏会遍历窗口里所有节点，
      * 如果每个节点都同步重建一次菜单，主线程会被压死，读屏等超时后播报
-     * 「无可用操作」——强哥遇到的「快速滑动没有默认操作」就是这个。
+     * 「无可用操作」——用户遇到的「快速滑动没有默认操作」就是这个。
      * 所以只有真正被聚焦的行才同步建菜单，其余行只用缓存或异步预热。
      */
     static boolean hasCachedLabels(View anchor) {
@@ -285,7 +285,7 @@ final class WeChatMenuHook {
             return cached.labels;
         }
         if (!force && rateExceeded(now)) {
-            // 遍历风暴中：不建。有旧缓存就先拿旧的顶上（强哥 2026-10-21：
+            // 遍历风暴中：不建。有旧缓存就先拿旧的顶上（用户 2026-10-21：
             // 会话列表「有时候没有默认操作」就是这里没兜底），同时交给延迟补建。
             return cached != null ? cached.labels : null;
         }
@@ -315,7 +315,7 @@ final class WeChatMenuHook {
      *
      * <p>绝不能往行上广播 TYPE_WINDOW_CONTENT_CHANGED：读屏收到就会重读窗口、
      * 重新锚定无障碍焦点，用户正在操作菜单里单指滑动会被拽回列表，
-     * 滑动就变成了「跳到下一个聊天」（强哥 2026-10-21 反馈）。
+     * 滑动就变成了「跳到下一个聊天」（实测反馈）。
      * 装饰本来就在 findNodeByAddress 里同步进行，读屏拿到的就是带动作的节点，
      * 不需要额外通知。
      */
@@ -518,7 +518,7 @@ final class WeChatMenuHook {
      * 会话列表同理。这些状态直到弹窗 dismiss 时 invoke
      * r.onDismiss() → 外部 I 监听器（p0/r3 …）才会恢复页面焦点、
      * 回放被挂起的更新队列。我们根本不创建弹窗，
-     * 状态机就会永远停在「菜单开着」——强哥 2026-10-21 的
+     * 状态机就会永远停在「菜单开着」——用户 2026-10-21 的
      * 「发了消息不上屏/会话列表不刷新」就是这个：更新全被收进
      * ChattingContext 的队列等回放，而回放永远不触发。
      *
