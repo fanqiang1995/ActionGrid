@@ -194,7 +194,7 @@ final class PhoneMenuBridge {
      * 头像一律不按（群聊长按头像会往输入框插 @昵称），
      * 图片消息本体允许（用户聚焦的就是它，类名不带 Avatar）。
      */
-    private static boolean pressForMenu(View row, View origin, boolean allowDfs) {
+    static boolean pressForMenu(View row, View origin, boolean allowDfs) {
         if (row.performLongClick()) {
             return true;
         }

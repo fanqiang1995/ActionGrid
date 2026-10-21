@@ -98,6 +98,9 @@ final class PhoneCallLogAdapter {
 
     /** 诊断开关：平时关闭（省电、防 log 刷屏）；排查问题改 true 重编。 */
     private static final boolean DEBUG = false;
+    /** 诊断/探针总开关（强哥 2026-10-21：功能稳定后全关，省电）。
+     *  排查问题临时改 true 重新构建即可。 */
+    private static final boolean VERBOSE = false;
 
     /** 消息类型指纹：行的子 View 类名组合。
      *  自研容器拿不到数据位置（getPositionForView 恒 -1），但每种消息类型的
@@ -262,6 +265,9 @@ final class PhoneCallLogAdapter {
 
             PhoneMenuBridge.install(module);
 
+            boolean wxMenuHook = WeChatMenuHook.install(module, appClassLoader);
+            log("wechat menu hook " + (wxMenuHook ? "installed" : "unavailable"));
+
             installed = true;
             log("app adapter installed");
             return true;
@@ -330,12 +336,21 @@ final class PhoneCallLogAdapter {
                                         + item.getClass().getSimpleName());
                             }
                             rowView = item;
+                        } else if (spec == WECHAT_CONVERSATION && rowView != null) {
+                            // 同理：聚焦的在会话行里面的文字子 View 时，
+                            // 沿视图树往上找会话行根，动作仍然挂在聚焦节点上。
+                            View ancestor = findRowAncestor(rowView, spec.viewClassSuffix);
+                            if (ancestor == null) {
+                                continue;
+                            }
+                            rowView = ancestor;
                         } else {
                             continue;
                         }
                     }
                 }
-                decorateRow(node, spec, rowView, focusView, controller);
+                decorateRow(node, spec, rowView, focusView, controller,
+                        node.isAccessibilityFocused() || node.isFocused());
                 return;
             }
         } catch (Throwable throwable) {
@@ -345,10 +360,57 @@ final class PhoneCallLogAdapter {
     }
 
     private static void decorateRow(AccessibilityNodeInfo node, Spec spec,
-                                    View rowView, View focusView, Object controller) {
+                                    View rowView, View focusView, Object controller,
+                                    boolean focused) {
         if (DEBUG && WECHAT_PACKAGE.equals(spec.packageName)) {
             // 一次性诊断：拿真实结构，不再盲猜字段名。
             WeChatDumper.dumpOnce(rowView);
+        }
+        // 聊天页：直连钩子（今天这套）。
+        // 会话列表：强哥 2026-10-21 拍板回退到昨天那套（预设+静默发现+弹窗拦截），
+        // 昨天那套在会话列表上很稳，今天的直连只留给聊天页。
+        if (WECHAT_PACKAGE.equals(spec.packageName) && spec == WECHAT_CHAT) {
+            int injected = 0;
+            if (WeChatMenuHook.isAvailable() && rowView != null) {
+                // 会话列表弹窗会把聊天标题夹成一项，喂给钩子过滤；
+                // 聊天页菜单都是操作名，不筛。
+                boolean dropTitle = spec == WECHAT_CONVERSATION;
+                // 快速滑动时读屏会遍历窗口里所有节点，每个都同步重建一次菜单会把
+                // 主线程压死，读屏等超时就播报「无可用操作」。所以：
+                //   · 真正被聚焦的行 → 同步建，立刻可用；
+                //   · 其余行 → 只吃缓存，没缓存就异步预热，不堵主线程。
+                // origin=聚焦的节点：长按从它往上找监听器，别按到头像。
+                String[] menu = WeChatMenuHook.labelsFor(rowView, focusView, false, focused,
+                        wxTemplateKey(spec, rowView));
+                if (menu == null || menu.length == 0) {
+                    // 这一行自己的菜单还没建好（限流/刚进页面）：
+                    // 先用同类行的模板把操作顶上——绝不能出现「这一行没操作」。
+                    menu = WeChatMenuHook.templateLabels(wxTemplateKey(spec, rowView));
+                    WeChatMenuHook.scheduleLabelsRetry(rowView, focusView, false);
+                }
+                if (menu != null) {
+                    for (int menuIndex = 0;
+                         menuIndex < menu.length && menuIndex < MENU_DYNAMIC_LIMIT;
+                         menuIndex++) {
+                        if (!menu[menuIndex].isEmpty()) {
+                            addAction(node, spec.base + MENU_DYNAMIC_OFFSET + menuIndex,
+                                    menu[menuIndex]);
+                            injected++;
+                        }
+                    }
+                }
+                if (WECHAT_PACKAGE.equals(spec.packageName)) {
+                    // 直接看节点上真实带了哪些动作：读屏显示的菜单就来自这里，
+                    // 与日志里的 injected 数对不上时靠它定位。
+                    dumpActionsOnce(spec, rowView, node);
+                }
+            }
+            if (VERBOSE) {
+                log("wx fastpath " + spec.key()
+                        + " hook=" + WeChatMenuHook.isAvailable()
+                        + " injected=" + injected);
+            }
+            return;
         }
         String key = spec.key();
         if (WECHAT_CHAT == spec && rowView != null) {
@@ -448,17 +510,54 @@ final class PhoneCallLogAdapter {
         }
     }
 
-    private static final java.util.Set<String> ACTIONS_DUMPED =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 从子 View 沿视图树往上找类名匹配的行根（最多 10 层）。 */
+    private static View findRowAncestor(View start, String classSuffix) {
+        ViewParent parent = start.getParent();
+        for (int depth = 0; depth < 10 && parent instanceof View view; depth++) {
+            if (view.getClass().getName().endsWith(classSuffix)) {
+                return view;
+            }
+            parent = view.getParent();
+        }
+        return null;
+    }
+
+    /** 每类行 dump 前 3 个节点，便于看行间差异；再多是噪音。 */
+    private static final int ACTIONS_DUMP_LIMIT = 3;
+    private static final java.util.Map<String, Integer> ACTIONS_DUMPED =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<>());
 
     /** 每类行只打印一次最终注入的全部 action，验证到底塞了几条、有没有重复。 */
+    /** 模板键：同一类行共用一个菜单模板（公众号行只有两项，单独一类）。 */
+    private static String wxTemplateKey(Spec spec, View rowView) {
+        String cls = rowView == null ? "" : rowView.getClass().getName();
+        String suffix = "";
+        if (spec == WECHAT_CONVERSATION && rowView != null) {
+            try {
+                if (WeChatProbe.isOfficialAccount(rowView)) {
+                    suffix = "|official";
+                }
+            } catch (Throwable ignored) {
+                // 探测失败就当普通行
+            }
+        }
+        return spec.key() + "|" + cls + suffix;
+    }
+
     private static void dumpActionsOnce(Spec spec, View rowView, AccessibilityNodeInfo node) {
         String key = spec.key();
         if (WECHAT_CHAT == spec && rowView != null) {
             key = chatMenuKey(rowView);
         }
-        if (!WECHAT_PACKAGE.equals(spec.packageName) || !ACTIONS_DUMPED.add(key)) {
+        if (!WECHAT_PACKAGE.equals(spec.packageName)) {
             return;
+        }
+        synchronized (ACTIONS_DUMPED) {
+            int seen = ACTIONS_DUMPED.getOrDefault(key, 0);
+            if (seen >= ACTIONS_DUMP_LIMIT) {
+                return;
+            }
+            ACTIONS_DUMPED.put(key, seen + 1);
         }
         try {
             List<AccessibilityNodeInfo.AccessibilityAction> list = node.getActionList();
@@ -476,6 +575,14 @@ final class PhoneCallLogAdapter {
 
     private static void addAction(AccessibilityNodeInfo node, int id, String label) {
         try {
+            // 去重：同一个节点在一次窗口遍历里会被反复装饰，
+            // 不去重就会把同名动作堆上去，读屏菜单里出现重复项。
+            List<AccessibilityNodeInfo.AccessibilityAction> existing = node.getActionList();
+            for (int index = 0; index < existing.size(); index++) {
+                if (existing.get(index).getId() == id) {
+                    return;
+                }
+            }
             boolean sealed = (boolean) nodeIsSealed.invoke(node);
             if (sealed) {
                 nodeSetSealed.invoke(node, false);
@@ -489,9 +596,16 @@ final class PhoneCallLogAdapter {
         }
     }
 
+    /** 每个 action id 只打一次，确认读屏到底有没有把动作发进来。 */
+    private static final java.util.Set<Integer> SEEN_ACTIONS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private static Object handleAction(XposedInterface.Chain chain) throws Throwable {
         long nodeId = (long) chain.getArg(0);
         int action = (int) chain.getArg(1);
+        if (VERBOSE && SEEN_ACTIONS.add(action)) {
+            log("action in id=0x" + Integer.toHexString(action) + " node=" + nodeId);
+        }
         Match match = resolve(action);
         if (match == null) {
             return chain.proceed();
@@ -510,17 +624,19 @@ final class PhoneCallLogAdapter {
             boolean handled = false;
             try {
                 if (match.menuIndex >= 0) {
-                    // 聊天消息：按行类名+消息类型拿到对应菜单，再取本槽位的文案。
-                    View item = findChatItemAncestor(row);
-                    View target = item != null ? item : row;
-                    String[] menu = DISCOVERED_MENUS.get(chatMenuKey(target));
-                    String label = menu != null && match.menuIndex < menu.length
-                            ? menu[match.menuIndex] : null;
-                    if (label != null) {
-                        // origin=聚焦的原节点，长按从它往上找监听器，别按到头像。
-                        handled = PhoneMenuBridge.runMenuAction(target, row, label);
-                        WeChatProbe.invalidate(target);
+                    // 微信直连：当场重建菜单（监听器绑着“当前这一行”），
+                    // 用微信自己的 onMMMenuItemSelected 执行，与点弹窗完全同路。
+                    View anchor = row;
+                    if (match.spec != WECHAT_CONVERSATION) {
+                        View item = findChatItemAncestor(row);
+                        if (item != null) {
+                            anchor = item;
+                        }
                     }
+                    // 撞上别的菜单构建就先等一等再重试：读屏用户点的就是这一下，
+                    // 直接回 false 就是「有时候不灵」（强哥 2026-10-21 反馈）。
+                    retryWxExecute(anchor, row, match.menuIndex, callback, interactionId, 0);
+                    return;
                 } else if (dynamicLabel != null) {
                     handled = PhoneMenuBridge.runMenuAction(row, null, dynamicLabel);
                 } else if (entry != null) {
@@ -555,6 +671,23 @@ final class PhoneCallLogAdapter {
         return null;
     }
 
+    private static final int WX_EXECUTE_MAX_ATTEMPTS = 4;
+
+    /** 微信菜单项执行：撞上别的菜单构建就 150ms 后重试（最多 4 次），最终回结果。 */
+    private static void retryWxExecute(View anchor, View origin, int index,
+                                       Object callback, int interactionId, int attempt) {
+        boolean handled = WeChatMenuHook.execute(anchor, origin, index);
+        log("wx exec slot=" + index + " handled=" + handled + " try=" + attempt
+                + " row=" + origin.getClass().getSimpleName());
+        if (!handled && WeChatMenuHook.lastRunBusy()
+                && attempt + 1 < WX_EXECUTE_MAX_ATTEMPTS) {
+            MAIN.postDelayed(() -> retryWxExecute(anchor, origin, index,
+                    callback, interactionId, attempt + 1), 150L);
+            return;
+        }
+        deliver(callback, interactionId, handled);
+    }
+
     private static Match resolve(int action) {
         for (Spec spec : SPECS) {
             for (Entry entry : spec.entries) {
@@ -568,8 +701,9 @@ final class PhoneCallLogAdapter {
             int index = action - (spec.base + MENU_DYNAMIC_OFFSET);
             if (index >= 0 && index < MENU_DYNAMIC_LIMIT) {
                 if (spec == WECHAT_CHAT) {
-                    // 聊天消息：具体文案要等拿到行才能按类名解析，这里只记槽位。
-                    return new Match(spec, null, null, index);
+                    // 聊天页：直连钩子（行内的菜单逐条对应，比回退方案准）
+                    return WeChatMenuHook.isAvailable()
+                            ? new Match(spec, null, null, index) : null;
                 }
                 String[] menu = DISCOVERED_MENUS.get(spec.key());
                 String label = null;
@@ -625,7 +759,7 @@ final class PhoneCallLogAdapter {
     }
 
     private static void log(String message) {
-        if (host == null) {
+        if (!VERBOSE || host == null) {
             return;
         }
         try {
